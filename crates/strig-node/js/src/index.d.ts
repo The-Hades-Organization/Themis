@@ -709,6 +709,147 @@ export type ElevateResult = ApprovalAudit &
     | { ok: false; code: 'NOT_PENDING' | 'UNKNOWN' | 'DUPLICATE' }
   );
 
+/** Who may review an item of a recertification campaign. */
+export type ReviewerRule =
+  | { kind: 'permission'; permission: string; resource: Resource }
+  | { kind: 'role'; role: string }
+  | { kind: 'subject'; id: string };
+
+/** Sends the items about one permission or role to a reviewer other than the campaign's default. */
+export interface ReviewerRoute {
+  permission?: string;
+  role?: string;
+  reviewer: ReviewerRule;
+}
+
+/** What a campaign reviews: an empty list means everything on that axis; only `permissions` selects only grants. */
+export interface RecertScope {
+  anchor?: { kind: string; id?: string };
+  permissions?: string[];
+  roles?: string[];
+  subjectKinds?: string[];
+}
+
+/** What happens to an item nobody reviewed by the deadline. */
+export type RecertDefaultAction = 'expire' | 'flag' | 'escalate';
+
+/** A campaign to open. `dueAt` and `keepPeriodMs` are in milliseconds. */
+export interface CampaignSpec {
+  id: string;
+  name?: string;
+  scope?: RecertScope;
+  reviewer: ReviewerRule;
+  routes?: ReviewerRoute[];
+  /** The permission every reviewer (and delegate) must hold, and on which resource. */
+  reviewerPermission: string;
+  reviewerResource: Resource;
+  dueAt: number | bigint;
+  keepPeriodMs: number | bigint;
+  defaultAction?: RecertDefaultAction;
+  escalateTo?: ReviewerRule;
+}
+
+export type RecertDecision = { action: 'keep' } | { action: 'revoke' } | { action: 'delegate'; to: Subject };
+
+export type RecertItemState =
+  | { state: 'open' }
+  | { state: 'kept'; by: string; at: number; until: number; reason?: string }
+  | { state: 'revoked'; by: string; at: number; reason?: string }
+  | { state: 'expired'; by: string; at: number }
+  | { state: 'flagged'; at: number; reason?: string }
+  | { state: 'escalated'; at: number; to: ReviewerRule };
+
+export interface RecertItem {
+  id: string;
+  target: { kind: 'grant'; grant: Grant } | { kind: 'role'; subject: Subject; role: RoleAssignment };
+  holder?: string;
+  holderRole?: string;
+  reviewer: ReviewerRule;
+  assignee?: string;
+  delegations?: { from: string; to: string; at: number; reason?: string }[];
+  /** What revoking this access would take away from others. */
+  impact?: Impact;
+  state: RecertItemState;
+}
+
+/** A recertification campaign as the engine returns it and the store keeps it. `revision` counts the writes. */
+export interface Campaign {
+  id: string;
+  name?: string;
+  scope: RecertScope;
+  reviewer: ReviewerRule;
+  routes?: ReviewerRoute[];
+  reviewerPermission: string;
+  reviewerResource: Resource;
+  openedBy: string;
+  openedAt: number;
+  dueAt: number;
+  keepPeriodMs: number;
+  defaultAction: RecertDefaultAction;
+  escalateTo?: ReviewerRule;
+  status: { state: 'open' } | { state: 'closed'; by: string; at: number };
+  items: RecertItem[];
+  revision: number;
+}
+
+export interface CampaignReport {
+  campaign: string;
+  name?: string;
+  status: Campaign['status'];
+  openedBy: string;
+  openedAt: number;
+  dueAt: number;
+  defaultAction: RecertDefaultAction;
+  total: number;
+  open: number;
+  kept: number;
+  revoked: number;
+  expired: number;
+  flagged: number;
+  escalated: number;
+  delegated: number;
+  byReviewer: Record<string, { kept: number; revoked: number; delegated: number }>;
+  /** The items a flag or an escalation left without an answer. */
+  unresolved: string[];
+}
+
+/**
+ * One step of the recertification flow, as `Engine.recertify` takes it. `open` needs `campaignSpec` (and `subjects`,
+ * the people whose roles are certified); `decide` needs `campaign`, `item`, `decision` and `by`; `close` and `report`
+ * act on `campaign`; `list` takes `campaigns`.
+ */
+export interface RecertifyInput extends ApprovalFlowInput {
+  op: 'open' | 'decide' | 'close' | 'report' | 'list';
+  campaignSpec?: CampaignSpec;
+  campaign?: Campaign;
+  campaigns?: Campaign[];
+  subjects?: Subject[];
+  by?: Subject;
+  item?: string;
+  decision?: RecertDecision;
+  reason?: string;
+}
+
+/**
+ * `decide` and `close` carry the `grants` to persist and the subjects whose role the revocation took
+ * (`revokedRole`, `revokedRoles`). Nothing is stored by the engine.
+ */
+export type RecertifyResult = ApprovalAudit &
+  (
+    | {
+        ok: true;
+        campaign?: Campaign;
+        item?: RecertItem;
+        grants?: Grant[];
+        revokedRole?: Subject | null;
+        revokedRoles?: Subject[];
+        report?: CampaignReport;
+        campaigns?: Campaign[];
+      }
+    | { ok: false; code: 'REFUSED'; violations: Violation[] }
+    | { ok: false; code: 'UNKNOWN' | 'DUPLICATE' | 'CLOSED' | 'STALE' }
+  );
+
 /** What `propose`, `resolve` and `expire` share with `apply`: the state they judge against and the audit. */
 export interface ApprovalFlowInput {
   /** The grants as they are now. */
@@ -1061,6 +1202,8 @@ export declare class Engine<P extends string = string> {
   resolve(input: ResolveInput): ResolveResult;
   /** Requests, approves, refuses, revokes or reviews a temporary elevation, break-glass included. Nothing is stored: see `Elevations` in `@the-hades-organization/strig/approvals`. */
   elevate(input: ElevateInput): ElevateResult;
+  /** Opens, decides, closes or reports an access recertification campaign. Nothing is stored: see `Recertifications` in `@the-hades-organization/strig/approvals`. */
+  recertify(input: RecertifyInput): RecertifyResult;
   /** Closes the requests whose expiry has come and returns them. */
   expire(input: ExpireInput): ExpireResult;
   /** Tries to write the records waiting in the retry queue now and returns its counters. */

@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use strig::{
-    Anchor, ApprovalPolicy, Approvals, Attributes, Catalog, CatalogConformance, Context, Engine, Governance, Grant,
-    GrantIndex, GrantSource, Mutation, MutationKind, ObjectRef, PendingError, PendingRequest, PendingStatus,
-    PendingStore, PermissionDef, Proposed, Request, RequirePermission, Resource, Review, RoleAssignment, Subject,
-    SubjectMatcher, TargetSelector, Tuple, TupleIndex, TupleStore, TupleSubject,
+    Anchor, ApprovalPolicy, Approvals, Attributes, Campaign, Catalog, CatalogConformance, Context, Engine, Governance,
+    Grant, GrantIndex, GrantSource, Mutation, MutationKind, ObjectRef, PendingError, PendingRequest, PendingStatus,
+    PendingStore, PermissionDef, Proposed, RecertError, RecertStore, Request, RequirePermission, Resource, Review,
+    RoleAssignment, Subject, SubjectMatcher, TargetSelector, Tuple, TupleIndex, TupleStore, TupleSubject,
 };
 use strig_postgres::{
-    LATEST_VERSION, PgPendingStore, PgStore, PgTables, PgTransport, connect, migrate_with, schema_version,
+    LATEST_VERSION, PgPendingStore, PgRecertStore, PgStore, PgTables, PgTransport, connect, migrate_with,
+    schema_version,
 };
 use strig_sync::Hub;
 use tokio_postgres::Client;
@@ -110,7 +111,7 @@ async fn migrate_is_idempotent_versioned_and_never_destructive() {
         .unwrap()
         .with_prefix("alt")
         .unwrap();
-    assert_eq!(migrate_with(&db.client, &other).await.unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(migrate_with(&db.client, &other).await.unwrap(), vec![1, 2, 3, 4, 5]);
     assert!(other.all_grants(&db.client).await.unwrap().is_empty());
     assert!(PgTables::default().in_schema("bad\"schema").is_err());
     db.drop_schema().await;
@@ -588,5 +589,71 @@ async fn governance_result_is_written_with_the_notify_and_another_instance_reloa
     tx.commit().await.unwrap();
     assert_eq!(t.roles_of(&db.client, "user", "u1").await.unwrap().len(), 1);
     assert!(!store_b.is_stale());
+    db.drop_schema().await;
+}
+
+fn campaign(id: &str, opened_at: u64, revision: u64, closed: bool) -> Campaign {
+    let status = if closed {
+        serde_json::json!({ "state": "closed", "by": "bia", "at": 900 })
+    } else {
+        serde_json::json!({ "state": "open" })
+    };
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "scope": {},
+        "reviewer": { "kind": "permission", "permission": "org.manage", "resource": { "path": [] } },
+        "reviewerPermission": "org.recertify",
+        "reviewerResource": { "path": [] },
+        "openedBy": "bia",
+        "openedAt": opened_at,
+        "dueAt": opened_at + 1_000,
+        "keepPeriodMs": 86_400_000,
+        "defaultAction": "expire",
+        "status": status,
+        "items": [],
+        "revision": revision,
+    }))
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recert_store_keeps_campaigns_and_refuses_stale_and_closed_writes() {
+    let Some(db) = Db::new().await else { return };
+    let store = PgRecertStore::connect(&db.url, db.tables.clone()).await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        store.insert(campaign("c2", 200, 0, false)).unwrap();
+        store.insert(campaign("c1", 100, 0, false)).unwrap();
+        assert_eq!(
+            store.insert(campaign("c1", 100, 0, false)),
+            Err(RecertError::Duplicate("c1".into()))
+        );
+        assert_eq!(store.get("c1").unwrap().unwrap().opened_at, 100);
+        assert_eq!(store.get("none").unwrap(), None);
+        let ids: Vec<_> = store.list().unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["c1", "c2"]);
+
+        store.update(campaign("c1", 100, 1, false)).unwrap();
+        assert_eq!(store.get("c1").unwrap().unwrap().revision, 1);
+        assert_eq!(
+            store.update(campaign("c1", 100, 1, false)),
+            Err(RecertError::Stale("c1".into()))
+        );
+        assert_eq!(
+            store.update(campaign("c1", 100, 5, false)),
+            Err(RecertError::Stale("c1".into()))
+        );
+        assert_eq!(
+            store.update(campaign("ghost", 1, 1, false)),
+            Err(RecertError::Unknown("ghost".into()))
+        );
+
+        store.update(campaign("c1", 100, 2, true)).unwrap();
+        assert_eq!(
+            store.update(campaign("c1", 100, 3, false)),
+            Err(RecertError::Closed("c1".into()))
+        );
+    })
+    .await
+    .unwrap();
     db.drop_schema().await;
 }

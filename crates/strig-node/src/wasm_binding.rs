@@ -537,6 +537,15 @@ impl WasmEngine {
         )
     }
 
+    pub fn recertify(&self, input: JsValue) -> Result<JsValue, JsFailure> {
+        to_js(
+            &self
+                .inner
+                .recertify(from_js(input)?, crate::millis("now", js_sys::Date::now()))
+                .map_err(err)?,
+        )
+    }
+
     pub fn expire(&self, input: JsValue) -> Result<JsValue, JsFailure> {
         to_js(
             &self

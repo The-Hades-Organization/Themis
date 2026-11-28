@@ -208,6 +208,7 @@ fn run(reg: &mut Registry, op: &str, input: &Value) -> BindingResult<Value> {
         "propose" => engine_only(reg, input, |e| e.propose(input_of(input)?, clock_of(input))),
         "resolve" => engine_only(reg, input, |e| e.resolve(input_of(input)?, clock_of(input))),
         "elevate" => engine_only(reg, input, |e| e.elevate(input_of(input)?, clock_of(input))),
+        "recertify" => engine_only(reg, input, |e| e.recertify(input_of(input)?, clock_of(input))),
         "expire" => engine_only(reg, input, |e| e.expire(input_of(input)?, clock_of(input))),
         other => Err(BindingError::new(
             "INVALID_ARGUMENT",

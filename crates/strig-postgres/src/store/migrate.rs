@@ -6,7 +6,7 @@ use crate::query::{PgQueryError, PgTables};
 use crate::quote_ident;
 
 /// Highest schema version this build of the library knows.
-pub const LATEST_VERSION: u32 = 4;
+pub const LATEST_VERSION: u32 = 5;
 
 struct Migration {
     version: u32,
@@ -29,6 +29,10 @@ const MIGRATIONS: [Migration; LATEST_VERSION as usize] = [
     Migration {
         version: 4,
         sql: exclusive_sql,
+    },
+    Migration {
+        version: 5,
+        sql: recert_sql,
     },
 ];
 
@@ -82,6 +86,23 @@ fn exclusive_sql(tables: &PgTables) -> String {
             expires_at bigint NOT NULL, \
             PRIMARY KEY (resource_kind, resource_id));\
         CREATE INDEX IF NOT EXISTS {due} ON {exclusive} (expires_at);"
+    )
+}
+
+fn recert_sql(tables: &PgTables) -> String {
+    let recert = tables.qualified(&tables.recert);
+    let order = quote_ident(&format!("{}_order_idx", tables.recert));
+    format!(
+        "CREATE TABLE IF NOT EXISTS {recert} (\
+            id text PRIMARY KEY, \
+            state text NOT NULL, \
+            opened_at bigint NOT NULL, \
+            revision bigint NOT NULL, \
+            data jsonb NOT NULL, \
+            CHECK (state = data->'status'->>'state'), \
+            CHECK (opened_at = (data->>'openedAt')::bigint), \
+            CHECK (revision = (data->>'revision')::bigint));\
+        CREATE INDEX IF NOT EXISTS {order} ON {recert} (opened_at, id);"
     )
 }
 

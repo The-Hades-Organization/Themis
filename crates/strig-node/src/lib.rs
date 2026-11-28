@@ -26,11 +26,12 @@ use serde_json::Value;
 use strig::ChainError;
 use strig::audit::{AuditLevel, AuditRecord, AuditStatus, FailMode, MemoryAuditLog, chain_head, verify_chain_anchored};
 use strig::{
-    ApprovalError, ApprovalPolicy, ApprovalRule, Approvals, Attributes, CapabilitySet, Context, Elevated,
-    ElevationPolicy, ElevationRequest, ElevationRule, Elevations, Engine, EngineSpec, Governance, Grant, ImpactOptions,
-    ImpactSource, InMemorySubjects, InMemoryTuples, InvariantSpec, MemoryPendingStore, Mutation, PathLayout,
-    PendingError, PendingRequest, PendingStore, Proposed, QueryContext, QueryLimits, Request, Resource, Review,
-    RoleTemplate, Subject, Tuple,
+    ApprovalError, ApprovalPolicy, ApprovalRule, Approvals, Attributes, Campaign, CampaignSpec, CapabilitySet, Context,
+    Elevated, ElevationPolicy, ElevationRequest, ElevationRule, Elevations, Engine, EngineSpec, Governance, Grant,
+    ImpactOptions, ImpactSource, InMemorySubjects, InMemoryTuples, InvariantSpec, MemoryPendingStore,
+    MemoryRecertStore, Mutation, PathLayout, PendingError, PendingRequest, PendingStore, Proposed, QueryContext,
+    QueryLimits, RecertDecision, RecertError, RecertStore, Recertifications, Request, Resource, Review, RoleTemplate,
+    Subject, Tuple,
 };
 
 #[cfg(feature = "timestamp")]
@@ -553,6 +554,36 @@ struct ElevateInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RecertInput {
+    /// `open`, `decide`, `close`, `report` ou `list`.
+    op: String,
+    /// A campanha a abrir (`op: 'open'`).
+    #[serde(default)]
+    campaign_spec: Option<CampaignSpec>,
+    /// A campanha guardada (`decide`, `close`, `report`).
+    #[serde(default)]
+    campaign: Option<Campaign>,
+    /// As campanhas guardadas (`list`).
+    #[serde(default)]
+    campaigns: Vec<Campaign>,
+    /// Quem tem papéis a certificar (`op: 'open'`).
+    #[serde(default)]
+    subjects: Vec<Subject>,
+    /// Quem abre, decide ou fecha.
+    #[serde(default)]
+    by: Option<Subject>,
+    #[serde(default)]
+    item: Option<String>,
+    #[serde(default)]
+    decision: Option<RecertDecision>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(flatten)]
+    flow: FlowInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReviewImpactInput {
     request: PendingRequest,
     #[serde(flatten)]
@@ -595,6 +626,29 @@ fn flow_reply(capture: &Capture, ok: bool, extra: Value) -> Value {
         base.extend(more);
     }
     out
+}
+
+fn recert_refused(capture: &Capture, error: RecertError) -> BindingResult<Value> {
+    Ok(match error {
+        RecertError::Refused(violations) => flow_reply(
+            capture,
+            false,
+            serde_json::json!({"code": "REFUSED", "violations": to_value(&violations)}),
+        ),
+        RecertError::Duplicate(_) => flow_reply(capture, false, serde_json::json!({"code": "DUPLICATE"})),
+        RecertError::Unknown(_) | RecertError::UnknownItem { .. } => {
+            flow_reply(capture, false, serde_json::json!({"code": "UNKNOWN"}))
+        }
+        RecertError::Closed(_) => flow_reply(capture, false, serde_json::json!({"code": "CLOSED"})),
+        RecertError::Stale(_) => flow_reply(capture, false, serde_json::json!({"code": "STALE"})),
+        RecertError::Store(message) => return Err(BindingError::invalid_input("recert", message)),
+        _ => {
+            return Err(BindingError::invalid_input(
+                "recert",
+                "erro de recertificação desconhecido",
+            ));
+        }
+    })
 }
 
 fn refused_reply(capture: &Capture, error: ApprovalError, request: Option<&PendingRequest>) -> BindingResult<Value> {
@@ -1521,6 +1575,117 @@ impl EngineHandle {
                 return Err(BindingError::invalid_argument(
                     "op",
                     format!("esperado request, approve, reject, revoke ou close_review, veio {other}"),
+                ));
+            }
+        })
+    }
+
+    /// A recertificação de acesso. `op: 'open'` abre a campanha (`campaignSpec`, `subjects?`, `by`) e devolve
+    /// `{ ok: true, campaign }`; `decide` (`campaign`, `item`, `decision`, `by`, `reason?`) devolve
+    /// `{ grants, revokedRole, campaign, item }`; `close` (`campaign`, `by`) devolve
+    /// `{ grants, revokedRoles, campaign, report }`; `report` (`campaign`) devolve `{ report }` e `list`
+    /// (`campaigns`) devolve `{ campaigns }` só com as abertas. Recusas como as de `resolve`
+    /// (`REFUSED`, `UNKNOWN`, `CLOSED`, `STALE`); nada se grava aqui, quem chama persiste.
+    pub fn recertify(&self, input: Value, clock: BindingResult<u64>) -> BindingResult<Value> {
+        host::forbid_reentry()?;
+        let mut input = input;
+        let custom = host::take_custom(&mut input)?;
+        let mut input: RecertInput = parse("recertify", input)?;
+        let (now, governance, capture, _policy, tuples) = self.flow_parts(&mut input.flow, &custom, clock)?;
+        let store = MemoryRecertStore::new();
+        for campaign in input.campaign.iter().chain(input.campaigns.iter()) {
+            store
+                .insert(campaign.clone())
+                .map_err(|e| BindingError::invalid_input("campaign", e))?;
+        }
+        let id = input.campaign.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+        let impact_options = input.flow.impact.as_ref().map(|i| i.options(tuples.as_ref(), now));
+        let flow = Recertifications::new(&governance, &store);
+        let flow = match impact_options.as_ref() {
+            Some(options) => flow.with_impact(options),
+            None => flow,
+        };
+        let flow = match input.flow.audit.as_ref().and_then(|a| a.fail_mode) {
+            Some(mode) => flow.fail_mode(mode),
+            None => flow,
+        };
+        let review = Review {
+            engine: &self.engine,
+            current: &input.flow.current,
+            tuples: tuples.as_ref().map(|s| s as &dyn strig::TupleStore),
+            now,
+            meta: &input.flow.meta,
+        };
+        let who = |by: Option<&Subject>| {
+            by.cloned()
+                .ok_or_else(|| BindingError::invalid_argument("by", "falta quem age"))
+        };
+        Ok(match input.op.as_str() {
+            "open" => {
+                let spec = input
+                    .campaign_spec
+                    .take()
+                    .ok_or_else(|| BindingError::invalid_argument("campaignSpec", "falta a campanha"))?;
+                match flow.open(&review, &who(input.by.as_ref())?, spec, &input.subjects) {
+                    Ok(campaign) => flow_reply(&capture, true, serde_json::json!({"campaign": to_value(&campaign)})),
+                    Err(error) => recert_refused(&capture, error)?,
+                }
+            }
+            "decide" => {
+                let item = input
+                    .item
+                    .as_deref()
+                    .ok_or_else(|| BindingError::invalid_argument("item", "falta o item"))?;
+                let decision = input
+                    .decision
+                    .take()
+                    .ok_or_else(|| BindingError::invalid_argument("decision", "falta a decisão"))?;
+                match flow.decide(
+                    &review,
+                    &who(input.by.as_ref())?,
+                    &id,
+                    item,
+                    decision,
+                    input.reason.as_deref(),
+                ) {
+                    Ok(decided) => flow_reply(
+                        &capture,
+                        true,
+                        serde_json::json!({
+                            "grants": to_value(&decided.grants),
+                            "revokedRole": decided.revoked_role.as_ref().map(to_value),
+                            "campaign": to_value(&decided.campaign),
+                            "item": to_value(&decided.item),
+                        }),
+                    ),
+                    Err(error) => recert_refused(&capture, error)?,
+                }
+            }
+            "close" => match flow.close(&review, &who(input.by.as_ref())?, &id) {
+                Ok(closed) => flow_reply(
+                    &capture,
+                    true,
+                    serde_json::json!({
+                        "grants": to_value(&closed.grants),
+                        "revokedRoles": to_value(&closed.revoked_roles),
+                        "campaign": to_value(&closed.campaign),
+                        "report": to_value(&closed.report),
+                    }),
+                ),
+                Err(error) => recert_refused(&capture, error)?,
+            },
+            "report" => match flow.report(&id) {
+                Ok(report) => flow_reply(&capture, true, serde_json::json!({"report": to_value(&report)})),
+                Err(error) => recert_refused(&capture, error)?,
+            },
+            "list" => match flow.open_campaigns() {
+                Ok(open) => flow_reply(&capture, true, serde_json::json!({"campaigns": to_value(&open)})),
+                Err(error) => recert_refused(&capture, error)?,
+            },
+            other => {
+                return Err(BindingError::invalid_argument(
+                    "op",
+                    format!("esperado open, decide, close, report ou list, veio {other}"),
                 ));
             }
         })

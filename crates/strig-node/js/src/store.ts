@@ -12,9 +12,9 @@ import type { FSWatcher } from 'node:fs';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
-import { PendingStoreError } from './approvals.js';
-import type { Approvals, DecideOptions, PendingStore } from './approvals.js';
-import type { ApplyInput, ApplyResult, Grant, PendingRequest, ResolveResult, RoleAssignment, Subject } from './index.js';
+import { PendingStoreError, RecertStoreError, checkRecertUpdate } from './approvals.js';
+import type { Approvals, DecideOptions, PendingStore, RecertStore } from './approvals.js';
+import type { ApplyInput, ApplyResult, Campaign, Grant, PendingRequest, ResolveResult, RoleAssignment, Subject } from './index.js';
 
 /** The only file version this store reads and writes. */
 export const STORE_VERSION = 1;
@@ -48,6 +48,8 @@ export interface StoreData {
   roles: Record<string, RoleAssignment[]>;
   /** Requests of the approval flow (`@the-hades-organization/strig/approvals`). Absent in a file that never held one; the version stays 1. */
   pending?: PendingRequest[];
+  /** Campaigns of the recertification flow. Absent in a file that never held one; the version stays 1. */
+  recert?: Campaign[];
 }
 
 export interface JsonFileStoreOptions {
@@ -113,6 +115,18 @@ function parse(path: string, text: string): StoreData {
       taken.add(request.id);
     }
     data.pending = raw.pending as PendingRequest[];
+  }
+  if (raw.recert !== undefined) {
+    if (!Array.isArray(raw.recert)) throw corrupt('`recert` must be an array');
+    const taken = new Set<string>();
+    for (const campaign of raw.recert) {
+      if (!isObject(campaign) || typeof campaign.id !== 'string' || campaign.id === '' || !isObject(campaign.status) || !Array.isArray(campaign.items)) {
+        throw corrupt('every campaign needs a string `id`, a `status` and `items`');
+      }
+      if (taken.has(campaign.id)) throw corrupt(`campaign "${campaign.id}" appears twice`);
+      taken.add(campaign.id);
+    }
+    data.recert = raw.recert as Campaign[];
   }
   return data;
 }
@@ -263,6 +277,25 @@ export class JsonFileStore {
       }),
     list: async () =>
       structuredClone([...((await this.fresh()).pending ?? [])].sort((a, b) => a.requestedAt - b.requestedAt || (a.id < b.id ? -1 : 1))),
+  };
+
+  /** The campaigns of the recertification flow, kept in the same file: `new Recertifications(engine, store.recertStore, options)`. */
+  readonly recertStore: RecertStore = {
+    get: async (id) => structuredClone((await this.fresh()).recert?.find((c) => c.id === id)),
+    put: (campaign) =>
+      this.mutate((data) => {
+        const all = (data.recert ??= []);
+        if (all.some((c) => c.id === campaign.id)) throw new RecertStoreError('RECERT_DUPLICATE', `campaign "${campaign.id}" already exists`);
+        all.push(structuredClone(campaign));
+      }),
+    update: (campaign) =>
+      this.mutate((data) => {
+        const at = (data.recert ?? []).findIndex((c) => c.id === campaign.id);
+        checkRecertUpdate(data.recert?.[at], campaign);
+        (data.recert as Campaign[])[at] = structuredClone(campaign);
+      }),
+    list: async () =>
+      structuredClone([...((await this.fresh()).recert ?? [])].sort((a, b) => a.openedAt - b.openedAt || (a.id < b.id ? -1 : 1))),
   };
 
   /**

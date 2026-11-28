@@ -33,7 +33,8 @@ pub use query::PgTables;
 #[cfg(feature = "exclusive")]
 pub use store::PgExclusiveStore;
 pub use store::{
-    LATEST_VERSION, PgGrants, PgPendingStore, PgStore, PgTuples, connect, migrate, migrate_with, schema_version,
+    LATEST_VERSION, PgGrants, PgPendingStore, PgRecertStore, PgStore, PgTuples, connect, migrate, migrate_with,
+    schema_version,
 };
 
 pub use window::{InstantOutOfRange, WindowColumns, WindowPredicate, candidate_predicate, window_predicate};

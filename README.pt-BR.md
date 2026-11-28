@@ -412,6 +412,40 @@ Mais duas ferramentas:
 - **Reserva contra lockout.** `NoLockout::with_reserve` diz quem deve assumir uma permissão crítica. Quando uma mudança deixaria essa permissão sem ninguém, a `Violation` traz uma `Suggestion` com a atribuição de papel que resolve. Nada é aplicado; a sugestão também vai para o registro de auditoria.
 - **Modelos de papel.** `RoleTemplate::materialize` transforma um modelo em grants comuns. O id e a versão do modelo vão nos metadados da mudança; os grants não guardam vínculo com o modelo.
 
+### Recertificação de acesso
+
+Uma campanha de recertificação (ISO 27001, SOX) faz alguém revisar, antes de um prazo, cada grant e cada atribuição de papel dentro de um escopo, e expira o que ninguém renovou. Ela se apoia nas aprovações, nas janelas de validade, no impacto, na elevação e na separação de funções: nada aqui faz IO, quem chama informa o instante e persiste.
+
+```rust
+let spec = CampaignSpec::new("2026-q4", ReviewerRule::permission("org.manage", org_resource), "org.manage", org_resource, due_at, 90 * DAY)
+    .scoped(RecertScope::new().anchored(org_anchor).permissions(["project.edit"]))
+    .routed(ReviewerRoute::for_role("admin", ReviewerRule::role("ciso")))
+    .defaulting_to(DefaultAction::Expire); // ou Flag, ou Escalate (com .escalating_to(regra))
+let flow = Recertifications::new(&governance, &store); // + .with_impact(&options)
+
+let campaign = flow.open(&review, &opener, spec, &people)?;       // um item por grant allow e por atribuição de papel no escopo
+flow.decide(&review, &bia, "2026-q4", "grant:ana-edit", RecertDecision::Keep, None)?;
+let revoked = flow.decide(&review, &bia, "2026-q4", "grant:caio-edit", RecertDecision::Revoke, Some("saiu do time"))?; // persista revoked.grants
+flow.decide(&review, &bia, "2026-q4", "grant:dan-edit", RecertDecision::Delegate { to: carl }, Some("o carl é o dono"))?;
+let closed = flow.close(&review, &bia, "2026-q4")?; // do prazo em diante: a ação padrão sobre o que ninguém revisou
+```
+
+- **Campanha.** O escopo (uma âncora, permissões, papéis, tipos de sujeito), o revisor (quem tem uma permissão sobre um recurso, um papel, ou um sujeito declarado, com `ReviewerRoute` que manda uma permissão ou um papel para outra regra), o prazo, o período em que um item mantido fica certificado e a ação padrão. A abertura é recusada quando quem abre é anônimo, o prazo não está no futuro, o período é zero, o padrão de escalar não tem revisor ou nada cai no escopo. Com `with_impact`, cada item carrega o que revogá-lo tiraria de outros.
+- **Decisão.** `Keep` certifica o acesso pelo período (o grant não muda: a certificação é o item). `Revoke` vira uma `Mutation` (`Remove` ou `RevokeRole`) pela governança, com o revisor como ator, então os invariantes e a auditoria valem; persista os `grants` e o `revoked_role` que ela devolve. `Delegate` passa o item a quem tem a permissão de revisor, com um motivo. O revisor precisa da permissão da campanha, nunca revisa o próprio acesso e a separação de funções vale para ele: revisor com conflito é recusado. Ninguém decide do prazo em diante.
+- **Fechamento.** Do `due_at` em diante, `close` roda a ação padrão sobre os itens que ninguém revisou: `Expire` os revoga pela governança (item que a governança recusa expirar vira `Flagged` com o motivo), `Flag` os deixa marcados e `Escalate` os entrega a outra regra de revisor. Itens marcados e escalados ficam no relatório como `unresolved`. `Campaign::report()` conta a campanha por resultado e por revisor.
+- **Auditoria.** A abertura, cada decisão e o fechamento são registros `recert_open`, `recert_decide` e `recert_close`, com campanha, item, decisão e alvo no campo `recert` (ver `docs/audit-format.md`).
+- **Onde fica.** `RecertStore` é `MemoryRecertStore`, `PgRecertStore` (`strig-postgres`, a migration 5 cria `strig_recert`) ou `JsonFileStore.recertStore` em JavaScript. Toda escrita leva o `revision` da campanha: escrita velha é recusada, então dois revisores da mesma campanha não se sobrescrevem; um host com vários processos também serializa por campanha antes de aplicar os grants.
+
+Em JavaScript, `Recertifications` (`@the-hades-organization/strig/approvals`) guarda as campanhas num `RecertStore` e chama `engine.recertify(input)`, que também existe em Python (`engine.recertify`) e no ABI Wasm (`recertify`):
+
+```js
+const flow = new Recertifications(engine, store.recertStore, { invariants, audit: { level: 'forensic' } });
+await flow.open({ id: '2026-q4', reviewer: { kind: 'permission', permission: 'org.manage', resource: orgResource }, reviewerPermission: 'org.manage', reviewerResource: orgResource, dueAt, keepPeriodMs: 90 * DAY, scope: { permissions: ['project.edit'] } }, opener, people, grants);
+await flow.decide('2026-q4', 'grant:ana-edit', { action: 'keep' }, bia, grants);
+await flow.decide('2026-q4', 'grant:caio-edit', { action: 'revoke' }, bia, grants, { reason: 'saiu do time', persist: (r) => saveGrants(r.grants) });
+await flow.close('2026-q4', bia, grants, { persist: (r) => saveGrants(r.grants) }); // do prazo em diante
+```
+
 ## Auditoria
 
 Com a feature `audit`, toda mudança que passa pela governança vira um `AuditRecord`, aplicada ou recusada. Registre tuplas ReBAC e atribuições de papel com `Auditor::tuple_change` e `Auditor::role_change`. Se o destino falha ao gravar, a governança recusa a mudança com a violação `audit`: sem registro, sem mudança (a menos que você escolha `FailMode::Open`, abaixo).

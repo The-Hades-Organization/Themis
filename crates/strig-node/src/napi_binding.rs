@@ -507,6 +507,14 @@ impl JsEngine {
             .map_err(err)
     }
 
+    /// Opens, decides, closes or reports an access recertification campaign.
+    #[napi]
+    pub fn recertify(&self, env: &Env, input: Unknown<'_>) -> Result<Value> {
+        self.inner
+            .recertify(json(env, input)?, crate::clock_ms(std::time::SystemTime::now()))
+            .map_err(err)
+    }
+
     /// Closes the pending requests whose expiry has come.
     #[napi]
     pub fn expire(&self, env: &Env, input: Unknown<'_>) -> Result<Value> {

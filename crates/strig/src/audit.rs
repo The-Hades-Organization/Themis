@@ -129,6 +129,12 @@ pub enum AuditAction {
     MutationExpire,
     /// Another actor closed the review of a break-glass elevation (`pending::elevation`).
     ElevationReview,
+    /// A recertification campaign was opened (`recert` module).
+    RecertOpen,
+    /// A reviewer decided an item of a campaign, or the closing applied the default action to it.
+    RecertDecide,
+    /// A recertification campaign was closed.
+    RecertClose,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +236,25 @@ pub struct PendingRef {
     pub reason: Option<String>,
 }
 
+/// The campaign and item a recertification record is about, kept from [`AuditLevel::Standard`] upward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RecertRef {
+    pub campaign: String,
+    /// The item a decision is about; absent on the opening and closing of a campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    /// `keep`, `revoke`, `delegate`, or the default action applied at the closing (`expire`, `flag`, `escalate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    /// Grant id, or `role@subject`, of the access the item is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Why the reviewer decided so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// One record of the trail. The optional fields appear depending on the level.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -262,6 +287,9 @@ pub struct AuditRecord {
     /// The request of an approval-flow record, from `standard` upward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingRef>,
+    /// The campaign of a recertification record, from `standard` upward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recert: Option<RecertRef>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_grant: Option<Grant>,
@@ -818,6 +846,7 @@ impl Auditor {
             suggestions: Vec::new(),
             decision: None,
             pending: None,
+            recert: None,
             full_grant: None,
             resource: None,
             explanation: None,
@@ -1037,6 +1066,32 @@ impl Auditor {
         record.at = at;
         if self.level >= AuditLevel::Standard {
             record.pending = Some(pending);
+            record.violations = self.violation_texts(violations);
+        }
+        self.detail(&mut record, actor, meta);
+        self.emit_with(record, permission, call)
+    }
+
+    /// Records a step of a recertification campaign (`recert` module). `permission` is the permission
+    /// the reviewer needs, so that its [`FailMode`] applies.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recert_event(
+        &self,
+        actor: &Subject,
+        action: AuditAction,
+        recert: RecertRef,
+        outcome: AuditOutcome,
+        violations: &[Violation],
+        meta: &Attributes,
+        permission: Option<&str>,
+        call: Option<FailMode>,
+        at: u64,
+    ) -> Result<Emitted, AuditError> {
+        let object = recert.item.clone().unwrap_or_else(|| recert.campaign.clone());
+        let mut record = self.base(actor, action, object, outcome);
+        record.at = at;
+        if self.level >= AuditLevel::Standard {
+            record.recert = Some(recert);
             record.violations = self.violation_texts(violations);
         }
         self.detail(&mut record, actor, meta);

@@ -16,6 +16,7 @@ mod exclusive;
 mod govern;
 mod migrate;
 mod pending;
+mod recert;
 mod roles;
 mod snapshot;
 
@@ -23,4 +24,5 @@ mod snapshot;
 pub use exclusive::PgExclusiveStore;
 pub use migrate::{LATEST_VERSION, migrate, migrate_with, schema_version};
 pub use pending::PgPendingStore;
+pub use recert::PgRecertStore;
 pub use snapshot::{PgGrants, PgStore, PgTuples, connect};

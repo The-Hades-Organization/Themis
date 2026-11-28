@@ -107,6 +107,10 @@ name = "elevation"
 required-features = ["audit"]
 
 [[test]]
+name = "recert"
+required-features = ["audit"]
+
+[[test]]
 name = "audit_report"
 required-features = ["audit"]
 

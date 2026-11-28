@@ -11,11 +11,17 @@ import type {
   ElevationRule,
   ExpireInput,
   ExpireResult,
+  Campaign,
+  CampaignReport,
+  CampaignSpec,
   Grant,
   ImpactOptions,
   InvariantSpec,
   PendingRequest,
   ProposeInput,
+  RecertDecision,
+  RecertifyInput,
+  RecertifyResult,
   ProposeResult,
   ResolveInput,
   ResolveResult,
@@ -377,5 +383,171 @@ export class Elevations {
 
   private clock(): number {
     return this.options.now?.() ?? Date.now();
+  }
+}
+
+export type RecertStoreErrorCode = 'RECERT_DUPLICATE' | 'RECERT_UNKNOWN' | 'RECERT_CLOSED' | 'RECERT_STALE';
+
+export class RecertStoreError extends Error {
+  readonly code: RecertStoreErrorCode;
+
+  constructor(code: RecertStoreErrorCode, message: string) {
+    super(message);
+    this.name = 'RecertStoreError';
+    this.code = code;
+  }
+}
+
+/**
+ * Where the campaigns are kept. `update` replaces an open campaign whose stored `revision` is one behind the new
+ * one: a stale write is `RECERT_STALE` and a write to a closed campaign is `RECERT_CLOSED`.
+ */
+export interface RecertStore {
+  get(id: string): Promise<Campaign | undefined> | Campaign | undefined;
+  put(campaign: Campaign): Promise<void> | void;
+  update(campaign: Campaign): Promise<void> | void;
+  list(): Promise<Campaign[]> | Campaign[];
+}
+
+/** Checks the rules of `RecertStore.update` against the stored campaign; the stores share it. */
+export function checkRecertUpdate(stored: Campaign | undefined, next: Campaign): void {
+  if (!stored) throw new RecertStoreError('RECERT_UNKNOWN', `campaign "${next.id}" does not exist`);
+  if (stored.status.state !== 'open') throw new RecertStoreError('RECERT_CLOSED', `campaign "${next.id}" is closed`);
+  if (stored.revision + 1 !== next.revision) throw new RecertStoreError('RECERT_STALE', `campaign "${next.id}" changed since it was read`);
+}
+
+export class MemoryRecertStore implements RecertStore {
+  private readonly campaigns = new Map<string, Campaign>();
+
+  get(id: string): Campaign | undefined {
+    const found = this.campaigns.get(id);
+    return found && structuredClone(found);
+  }
+
+  put(campaign: Campaign): void {
+    if (this.campaigns.has(campaign.id)) throw new RecertStoreError('RECERT_DUPLICATE', `campaign "${campaign.id}" already exists`);
+    this.campaigns.set(campaign.id, structuredClone(campaign));
+  }
+
+  update(campaign: Campaign): void {
+    checkRecertUpdate(this.campaigns.get(campaign.id), campaign);
+    this.campaigns.set(campaign.id, structuredClone(campaign));
+  }
+
+  list(): Campaign[] {
+    return [...this.campaigns.values()].map((c) => structuredClone(c)).sort((a, b) => a.openedAt - b.openedAt || (a.id < b.id ? -1 : 1));
+  }
+}
+
+/** The one call of the engine the recertification flow needs. `Engine` has it. */
+export interface RecertEngine {
+  recertify(input: RecertifyInput): RecertifyResult;
+}
+
+export interface RecertificationsOptions {
+  invariants?: InvariantSpec[];
+  /** The audit of every step: opening, each decision and the closing. */
+  audit?: ApplyInput['audit'];
+  /** Computes the impact of revoking every item when the campaign opens. */
+  impact?: ImpactOptions;
+  now?: () => number;
+}
+
+export interface RecertPersistOptions extends CallOptions {
+  /** Runs after the engine accepts the step and before the store keeps it: persist the grants (and the roles) here. A throw leaves the store as it was. */
+  persist?: (result: Extract<RecertifyResult, { ok: true }>) => Promise<void> | void;
+}
+
+/**
+ * Access recertification over a `RecertStore`: a reviewer keeps, revokes or delegates each grant and role
+ * assignment of a campaign before its deadline, and at the deadline the default action runs over what nobody
+ * reviewed. A revocation goes through the governance as the reviewer, so the invariants and the audit apply; the
+ * reviewer never reviews their own access.
+ */
+export class Recertifications {
+  private head: string | undefined;
+
+  constructor(
+    private readonly engine: RecertEngine,
+    readonly store: RecertStore,
+    private readonly options: RecertificationsOptions = {},
+  ) {
+    this.head = options.audit?.prevHash;
+  }
+
+  /** Opens the campaign: an item per grant of `current` and per role of `subjects` inside the scope. */
+  async open(spec: CampaignSpec, opener: Subject, subjects: Subject[], current: Grant[], options: CallOptions = {}): Promise<RecertifyResult> {
+    if (await this.store.get(spec.id)) throw new RecertStoreError('RECERT_DUPLICATE', `campaign "${spec.id}" already exists`);
+    const result = this.step({ op: 'open', campaignSpec: spec, subjects, by: opener }, current, options);
+    if (result.ok && result.campaign) await this.store.put(result.campaign);
+    return result;
+  }
+
+  /** `reviewer` keeps, revokes or delegates `item` of campaign `id`. */
+  async decide(
+    id: string,
+    item: string,
+    decision: RecertDecision,
+    reviewer: Subject,
+    current: Grant[],
+    options: RecertPersistOptions & { reason?: string } = {},
+  ): Promise<RecertifyResult> {
+    const campaign = await this.load(id);
+    const result = this.step(
+      { op: 'decide', campaign, item, decision, by: reviewer, ...(options.reason === undefined ? {} : { reason: options.reason }) },
+      current,
+      options,
+    );
+    if (result.ok && result.campaign) {
+      if (options.persist) await options.persist(result);
+      await this.store.update(result.campaign);
+    }
+    return result;
+  }
+
+  /** Closes the campaign from its deadline on: the default action runs over the items nobody reviewed. */
+  async close(id: string, closer: Subject, current: Grant[], options: RecertPersistOptions = {}): Promise<RecertifyResult> {
+    const campaign = await this.load(id);
+    const result = this.step({ op: 'close', campaign, by: closer }, current, options);
+    if (result.ok && result.campaign) {
+      if (options.persist) await options.persist(result);
+      await this.store.update(result.campaign);
+    }
+    return result;
+  }
+
+  /** The campaign counted by outcome and by reviewer. */
+  async report(id: string): Promise<CampaignReport> {
+    const result = this.step({ op: 'report', campaign: await this.load(id) }, [], {});
+    if (!result.ok || !result.report) throw new RecertStoreError('RECERT_UNKNOWN', `campaign "${id}" has no report`);
+    return result.report;
+  }
+
+  /** The campaigns still open. */
+  async openCampaigns(): Promise<Campaign[]> {
+    return (await this.store.list()).filter((c) => c.status.state === 'open');
+  }
+
+  private step(input: Pick<RecertifyInput, 'op'> & Partial<RecertifyInput>, current: Grant[], options: CallOptions): RecertifyResult {
+    const now = options.now ?? this.options.now?.();
+    const result = this.engine.recertify({
+      current,
+      ...(this.options.invariants ? { invariants: this.options.invariants } : {}),
+      ...(this.options.impact ? { impact: this.options.impact } : {}),
+      ...(this.options.audit ? { audit: { ...this.options.audit, ...(this.head === undefined ? {} : { prevHash: this.head }) } } : {}),
+      ...(options.meta ? { meta: options.meta } : {}),
+      ...(options.tuples ? { tuples: options.tuples } : {}),
+      ...(now === undefined ? {} : { now }),
+      ...input,
+    });
+    const hash = result.audits.at(-1)?.hash;
+    if (typeof hash === 'string') this.head = hash;
+    return result;
+  }
+
+  private async load(id: string): Promise<Campaign> {
+    const campaign = await this.store.get(id);
+    if (!campaign) throw new RecertStoreError('RECERT_UNKNOWN', `campaign "${id}" does not exist`);
+    return campaign;
   }
 }

@@ -28,7 +28,7 @@ A record is one JSON object in **compact JSON** (no whitespace), encoded as UTF-
 | 1 | `at` | integer, ms since the Unix epoch | always |
 | 2 | `level` | `minimal`, `standard`, `detailed`, `forensic` | always |
 | 3 | `actor` | string, the actor id (its kind when anonymous) | always |
-| 4 | `action` | `grant_add`, `grant_remove`, `tuple_add`, `tuple_remove`, `role_assign`, `role_revoke`, `decision`, `exclusive_acquire`, `exclusive_preempt`, `exclusive_release`, `exclusive_expire`, `mutation_propose`, `mutation_approve`, `mutation_reject`, `mutation_expire`, `elevation_review` | always |
+| 4 | `action` | `grant_add`, `grant_remove`, `tuple_add`, `tuple_remove`, `role_assign`, `role_revoke`, `decision`, `exclusive_acquire`, `exclusive_preempt`, `exclusive_release`, `exclusive_expire`, `mutation_propose`, `mutation_approve`, `mutation_reject`, `mutation_expire`, `elevation_review`, `recert_open`, `recert_decide`, `recert_close` | always |
 | 5 | `object` | string: grant id, `object#relation@subject`, `role@subject` (`role#scope@subject` with a scope), or `permission@path` | always |
 | 6 | `outcome` | `applied`, `rejected`, `allowed`, `denied`, `pending` | always |
 | 7 | `grant` | grant summary | `standard`+ on a grant change |
@@ -37,6 +37,7 @@ A record is one JSON object in **compact JSON** (no whitespace), encoded as UTF-
 | 10 | `suggestions` | list of suggestions | `standard`+ when an invariant proposed one |
 | 11 | `decision` | decision summary | `standard`+ on a decision |
 | 11b | `pending` | `{id, author, kind, target, expires_at?, reason?}`, the request of an approval-flow record | `standard`+ on `mutation_*` |
+| 11c | `recert` | `{campaign, item?, decision?, target?, reason?}`, the campaign of a recertification record | `standard`+ on `recert_*` |
 | 12 | `full_grant` | the whole grant | `detailed`+ on a grant change |
 | 13 | `resource` | the whole resource | `detailed`+ on a decision |
 | 14 | `explanation` | the full trace | `forensic` on a decision |
@@ -193,6 +194,13 @@ an approver, the `reason`. `outcome` says whether the step took effect:
 | `mutation_reject` | the approver | `applied` when the request was refused, `rejected` when the attempt was refused (`violations`) |
 | `mutation_expire` | `strig-expiry` | `applied` |
 | `elevation_review` | the reviewer | `applied` when the review of a break-glass elevation was closed (the note is the `reason`), `rejected` when the attempt was refused (the actor reviewing their own use, no permission, no open review, no forensic auditor) |
+
+| `recert_open` | the opener | `applied` when the campaign was opened, `rejected` when it was refused (anonymous opener, deadline not in the future, zero period, empty scope, audit) |
+| `recert_decide` | the reviewer | `applied` when the item was kept, revoked or delegated (`recert.decision`, the reason in `recert.reason`), `rejected` when refused (no reviewer permission, own access, separation of duties, past the deadline, invariants) |
+| `recert_close` | the closer | `applied` for the closing itself, one record per campaign, `rejected` when refused (before the deadline, no permission). Each item the default action took is a `recert_decide` by the closer with `recert.decision` `expire`, `flag` or `escalate` |
+
+A revocation by a reviewer, or by the closing, also writes the `grant_remove` or `role_revoke` record of the
+change itself, as for any governed change.
 
 An elevation (`Elevations` in Rust, `elevate` in the bindings) uses the same actions for its steps, with the
 record's metadata carrying `elevation`, `request_id`, `justification`, and, on a break-glass, `break_glass`

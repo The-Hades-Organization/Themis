@@ -104,6 +104,7 @@ pub struct PgTables {
     pub(crate) tuples: String,
     pub(crate) roles: String,
     pub(crate) pending: String,
+    pub(crate) recert: String,
     pub(crate) exclusive: String,
     pub(crate) migrations: String,
 }
@@ -116,6 +117,7 @@ impl Default for PgTables {
             tuples: "strig_tuples".to_string(),
             roles: "strig_roles".to_string(),
             pending: "strig_pending".to_string(),
+            recert: "strig_recert".to_string(),
             exclusive: "strig_exclusive".to_string(),
             migrations: "strig_migrations".to_string(),
         }
@@ -146,8 +148,8 @@ impl PgTables {
         Ok(self)
     }
 
-    /// Names all six tables `<prefix>_grants`, `<prefix>_tuples`, `<prefix>_roles`, `<prefix>_pending`,
-    /// `<prefix>_exclusive` and `<prefix>_migrations`.
+    /// Names all seven tables `<prefix>_grants`, `<prefix>_tuples`, `<prefix>_roles`, `<prefix>_pending`,
+    /// `<prefix>_recert`, `<prefix>_exclusive` and `<prefix>_migrations`.
     ///
     /// # Errors
     ///
@@ -160,6 +162,7 @@ impl PgTables {
             tuples: table_identifier(format!("{prefix}_tuples"))?,
             roles: table_identifier(format!("{prefix}_roles"))?,
             pending: table_identifier(format!("{prefix}_pending"))?,
+            recert: table_identifier(format!("{prefix}_recert"))?,
             exclusive: table_identifier(format!("{prefix}_exclusive"))?,
             migrations: table_identifier(format!("{prefix}_migrations"))?,
         })
