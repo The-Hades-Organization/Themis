@@ -8,7 +8,7 @@ use std::hash::Hash;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use strig::{CapabilitySet, Resource, Subject};
+use strig::{CapabilitySet, Resource, Revision, Subject};
 
 use crate::change::{Change, ChangeKind};
 use crate::hub::{ChangeSink, now_ms};
@@ -106,6 +106,17 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
     }
 }
 
+/// What the cache keeps per subject and scope: whose entry it is, the set, when the set stops being
+/// valid and the revision of the data it was computed from.
+#[derive(Clone)]
+struct CachedSet {
+    subject: Option<String>,
+    scope: Resource,
+    set: CapabilitySet,
+    boundary: Option<u64>,
+    revision: Option<Revision>,
+}
+
 /// [`CapabilitySet`] per subject and scope. Registered on the hub with [`crate::Hub::on_change`],
 /// it drops the entries a change affects.
 ///
@@ -114,7 +125,7 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
 /// monotonic lifetime does not count time the machine spent suspended; the wall-clock check on every
 /// read covers that and a clock step.
 pub struct CapabilityCache {
-    inner: TtlCache<String, (Option<String>, Resource, CapabilitySet, Option<u64>)>,
+    inner: TtlCache<String, CachedSet>,
 }
 
 impl CapabilityCache {
@@ -157,8 +168,44 @@ impl CapabilityCache {
         self.inner
             .get(&Self::key(subject, scope))
             // `wall_ms` is truncated to the millisecond: one more keeps the cut strict.
-            .filter(|(_, _, _, boundary)| boundary.is_none_or(|b| b > wall_ms.saturating_add(1)))
-            .map(|(_, _, set, boundary)| (set, boundary))
+            .filter(|entry| entry.boundary.is_none_or(|b| b > wall_ms.saturating_add(1)))
+            .map(|entry| (entry.set, entry.boundary))
+    }
+
+    /// Like [`CapabilityCache::get_with_boundary`], but the entry is served only if it was computed
+    /// from data at `required` or later. An entry with no revision, or from another data scope, does
+    /// not count: it is a miss, and the caller reloads (fail closed).
+    pub fn get_at_least(
+        &self,
+        subject: &Subject,
+        scope: &Resource,
+        required: &Revision,
+    ) -> Option<(CapabilitySet, Option<u64>)> {
+        self.get_revised(subject, scope, Some(required))
+            .map(|(set, boundary, _)| (set, boundary))
+    }
+
+    /// The entry with the revision of the data it was computed from, read in one lookup so the two
+    /// always belong together. With `required`, see [`CapabilityCache::get_at_least`].
+    pub fn get_revised(
+        &self,
+        subject: &Subject,
+        scope: &Resource,
+        required: Option<&Revision>,
+    ) -> Option<(CapabilitySet, Option<u64>, Option<Revision>)> {
+        let wall_ms = now_ms();
+        self.inner
+            .get(&Self::key(subject, scope))
+            .filter(|entry| entry.boundary.is_none_or(|b| b > wall_ms.saturating_add(1)))
+            .filter(|entry| {
+                required.is_none_or(|required| {
+                    entry
+                        .revision
+                        .as_ref()
+                        .is_some_and(|have| have.reaches(required).is_reached())
+                })
+            })
+            .map(|entry| (entry.set, entry.boundary, entry.revision))
     }
 
     /// Stores a set that was computed just now, by the system clock. See [`CapabilityCache::insert_at`].
@@ -194,9 +241,31 @@ impl CapabilityCache {
         next_boundary: Option<u64>,
         now_ms: u64,
     ) {
+        self.insert_revised(subject, scope, set, next_boundary, now_ms, None);
+    }
+
+    /// Like [`CapabilityCache::insert_with_boundary`], also recording the revision of the data the
+    /// set was computed from, so a later [`CapabilityCache::get_at_least`] can tell whether the entry
+    /// is fresh enough. Read the revision before loading the grants: a claim older than the data is
+    /// safe, a newer one is not.
+    pub fn insert_revised(
+        &self,
+        subject: &Subject,
+        scope: &Resource,
+        set: CapabilitySet,
+        next_boundary: Option<u64>,
+        now_ms: u64,
+        revision: Option<Revision>,
+    ) {
         self.inner.insert_for(
             Self::key(subject, scope),
-            (subject.id.clone(), scope.clone(), set, next_boundary),
+            CachedSet {
+                subject: subject.id.clone(),
+                scope: scope.clone(),
+                set,
+                boundary: next_boundary,
+                revision,
+            },
             max_age(next_boundary, now_ms),
         );
     }
@@ -231,7 +300,7 @@ impl ChangeSink for CapabilityCache {
             return;
         }
         self.inner
-            .retain(|_, (subject, scope, _, _)| !change.affects(subject.as_deref(), scope));
+            .retain(|_, entry| !change.affects(entry.subject.as_deref(), &entry.scope));
     }
 }
 

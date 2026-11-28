@@ -4,7 +4,7 @@ use std::error::Error;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use async_trait::async_trait;
-use strig::{Engine, Grant, InMemoryTuples};
+use strig::{Engine, Grant, InMemoryTuples, Revision};
 
 /// Why a source could not load. Any variant makes the server answer 503: no source, no allow.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +29,9 @@ pub struct Snapshot {
     pub engine: Arc<Engine>,
     pub grants: Vec<Grant>,
     pub tuples: Option<InMemoryTuples>,
+    /// The revision of the data this snapshot was read at, when the store numbers its writes. A
+    /// request that requires a `min_revision` is answered only from a snapshot that has reached it.
+    pub revision: Option<Revision>,
 }
 
 impl Snapshot {
@@ -37,7 +40,16 @@ impl Snapshot {
             engine,
             grants,
             tuples: None,
+            revision: None,
         }
+    }
+
+    /// Records the revision of the data of this snapshot. Read it **before** the grants: a revision
+    /// older than the data is a safe claim, a newer one lets stale data pass for fresh.
+    #[must_use]
+    pub fn with_revision(mut self, revision: Revision) -> Self {
+        self.revision = Some(revision);
+        self
     }
 
     #[must_use]

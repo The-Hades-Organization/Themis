@@ -20,7 +20,7 @@ All crates, the npm package, the Python package, the Go module tag and the Java 
 | **JSON spec** | The shape of `EngineSpec`, `Grant`, `Condition`, `Catalog`, the exported catalog and the files read by the JSON store, including their `schema` numbers (`DSL_SCHEMA` for the policy JSON). |
 | **Audit format** | The canonical form of a record and the hash of the chain, fixed in [audit-format.md](audit-format.md), with its test vector. |
 | **`errorCode`s** | The `code` of every error the JS, Python, Go and Java bindings raise (`ErrorCode`) and the stable machine-readable names the Rust errors map to. |
-| **Wire protocol** | The messages of `strig-sync`, `strig-server` and the JS `/protocol` module. |
+| **Wire protocol** | The messages of `strig-sync`, `strig-server` and the JS `/protocol` module. The client protocol is version 2 (`hello.version`, 1 when absent): version 2 adds revisions (`capabilities.revision`, `change.revision`, `refresh_at_least`, the `x-strig-min-revision` header and the `min_revision` field) as optional fields, so a peer that sends none keeps working. |
 | **`strig-inspect` command line** | Subcommands, flags and exit codes. The window and the text of messages are not covered. |
 
 Not public, and free to change in any release: items marked `#[doc(hidden)]`, anything under an `internal` or

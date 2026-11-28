@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use strig::Revision;
 use strig_sync::{Change, ChangeStream, Transport, TransportError};
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
@@ -119,6 +120,42 @@ impl PgTransport {
     pub fn channel(&self) -> &str {
         &self.channel
     }
+}
+
+/// Takes the next revision of `scope` from the Postgres sequence `sequence` (a name `regclass` accepts,
+/// optionally schema-qualified).
+///
+/// Call it inside the transaction that writes the change, so the revision commits with the change and
+/// a rolled-back change leaves only a gap, which revisions allow (they only grow). The scope names the
+/// data the sequence orders, for example one sequence per tenant.
+pub async fn next_revision<C: GenericClient + Sync>(
+    client: &C,
+    sequence: &str,
+    scope: &str,
+) -> Result<Revision, TransportError> {
+    let row = client
+        .query_one("SELECT nextval($1::text::regclass)", &[&sequence])
+        .await
+        .map_err(connection)?;
+    revision_from(scope, row.get::<_, i64>(0))
+}
+
+/// The latest revision `sequence` has handed out for `scope`; revision 0 when it has handed out none.
+pub async fn current_revision<C: GenericClient + Sync>(
+    client: &C,
+    sequence: &str,
+    scope: &str,
+) -> Result<Revision, TransportError> {
+    let row = client
+        .query_one("SELECT pg_sequence_last_value($1::text::regclass)", &[&sequence])
+        .await
+        .map_err(connection)?;
+    revision_from(scope, row.get::<_, Option<i64>>(0).unwrap_or(0))
+}
+
+fn revision_from(scope: &str, value: i64) -> Result<Revision, TransportError> {
+    let value = u64::try_from(value).map_err(|_| TransportError::Decode("negative revision".to_string()))?;
+    Ok(Revision::new(scope, value))
 }
 
 /// Sends `change` on the channel through the given client or transaction.

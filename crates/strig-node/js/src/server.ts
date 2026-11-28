@@ -3,7 +3,7 @@
 // pelo mesmo canal.
 import type { ServerResponse } from 'node:http';
 import type { CapabilitySet, Context as ContextClass, Engine, Grant, Subject } from './index.js';
-import { changeAffects, encodeSse, sameAnchor } from './protocol.js';
+import { changeAffects, encodeSse, PROTOCOL_VERSION, revisionReached, sameAnchor } from './protocol.js';
 import type { Anchor, Change, ChangeKind, ClientMessage, Resource, ServerMessage } from './protocol.js';
 
 export interface Transport {
@@ -20,6 +20,13 @@ export interface SessionOptions {
   scopes?: Resource[];
   provider?: Provider;
   heartbeatMs?: number;
+  /**
+   * The revision (`scope@value`) of the data this instance has loaded, for read-your-writes. Without
+   * it the session cannot prove a revision, so a `refresh_at_least` is answered with `revision_untracked`.
+   */
+  revision?: (scope: Resource) => Promise<string | undefined> | string | undefined;
+  /** A revision the session must reach before it sends any capabilities (the `min_revision` the client asked for). */
+  minRevision?: string;
 }
 
 export interface Session {
@@ -100,6 +107,8 @@ export function openSession({
   scopes = [],
   provider,
   heartbeatMs = 25_000,
+  revision,
+  minRevision,
   send,
 }: SessionOptions & { send: (message: ServerMessage) => void }): Session {
   const watched = [...scopes];
@@ -107,10 +116,21 @@ export function openSession({
   let pending: Change[] = [];
   let scheduled = false;
 
+  let required = minRevision;
+
   const push = async (scope: Resource): Promise<void> => {
     if (!provider || closed) return;
     try {
-      send({ type: 'capabilities', scope, set: await provider(subject, scope) });
+      const have = await revision?.(scope);
+      if (required !== undefined) {
+        const reached = revisionReached(required, have);
+        if (reached !== 'yes') {
+          send({ type: 'error', message: reached === 'behind' ? 'revision_not_reached' : reached === 'other_scope' ? 'revision_scope_mismatch' : 'revision_untracked' });
+          return;
+        }
+      }
+      const set = await provider(subject, scope);
+      send(have === undefined ? { type: 'capabilities', scope, set } : { type: 'capabilities', scope, set, revision: have });
     } catch (error) {
       send({ type: 'error', message: String((error as Error | undefined)?.message ?? error) });
     }
@@ -147,7 +167,7 @@ export function openSession({
   const timer = heartbeatMs ? setInterval(() => send({ type: 'ping' }), heartbeatMs) : undefined;
   (timer as { unref?: () => void } | undefined)?.unref?.();
 
-  send({ type: 'hello', origin: hub.origin, subject: subject.id });
+  send({ type: 'hello', origin: hub.origin, subject: subject.id, version: PROTOCOL_VERSION });
   const ready = pushAll();
 
   return {
@@ -166,6 +186,9 @@ export function openSession({
           if (at >= 0) watched.splice(at, 1);
         }
       } else if (message.type === 'refresh') {
+        await pushAll();
+      } else if (message.type === 'refresh_at_least') {
+        required = message.revision;
         await pushAll();
       }
     },

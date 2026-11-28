@@ -54,3 +54,52 @@ async fn hubs_exchange_changes_and_transactional_notify_reaches_everyone() {
         assert_eq!(got.kind, ChangeKind::Tuples);
     }
 }
+
+#[tokio::test]
+async fn sequence_revisions_grow_and_roll_back_leaves_a_gap() {
+    let Ok(url) = std::env::var("STRIG_PG_URL") else {
+        eprintln!("STRIG_PG_URL ausente: teste pulado");
+        return;
+    };
+    let (mut client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let sequence = format!("strig_rev_test_{}", std::process::id());
+    client
+        .batch_execute(&format!("CREATE SEQUENCE {sequence}"))
+        .await
+        .unwrap();
+
+    let none = strig_postgres::current_revision(&client, &sequence, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(none, strig::Revision::new("tenant", 0));
+    let first = strig_postgres::next_revision(&client, &sequence, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(first, strig::Revision::new("tenant", 1));
+
+    let tx = client.transaction().await.unwrap();
+    strig_postgres::next_revision(&tx, &sequence, "tenant").await.unwrap();
+    tx.rollback().await.unwrap();
+
+    let after = strig_postgres::next_revision(&client, &sequence, "tenant")
+        .await
+        .unwrap();
+    assert!(
+        after.value() > 2,
+        "the rolled-back revision leaves a gap, never repeats"
+    );
+    let current = strig_postgres::current_revision(&client, &sequence, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(current, after);
+    assert!(
+        strig_postgres::next_revision(&client, "no_such_sequence", "tenant")
+            .await
+            .is_err()
+    );
+    client
+        .batch_execute(&format!("DROP SEQUENCE {sequence}"))
+        .await
+        .unwrap();
+}

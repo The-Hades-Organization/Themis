@@ -672,7 +672,28 @@ A session watches scopes, that is, anchors such as `org:acme`. With a `Capabilit
 | Postgres | `strig-postgres` | `LISTEN/NOTIFY`. Call `strig_postgres::notify(&tx, channel, &change)` inside the transaction that writes the grant, and the notice goes out only on commit. TLS through `PgTransport::with_tls`. |
 | Your own | | NATS, Kafka or any broker: implement `Transport` (`publish` and `subscribe`). |
 
-The client protocol is JSON and identical over SSE and WebSocket. The server sends `hello`, `capabilities`, `change`, `resync`, `error` and `ping`; the client sends `watch`, `unwatch` and `refresh` (WebSocket only). For a web framework other than axum, forward the stream from `Session::open` and write each message with `ServerMessage::to_sse` or `to_json`.
+The client protocol is JSON and identical over SSE and WebSocket. The server sends `hello`, `capabilities`, `change`, `resync`, `error` and `ping`; the client sends `watch`, `unwatch`, `refresh` and `refresh_at_least` (WebSocket only). For a web framework other than axum, forward the stream from `Session::open` and write each message with `ServerMessage::to_sse` or `to_json`.
+
+### Reading your own writes
+
+After a change, no instance and no client should decide from state older than it. Each accepted change gets a **revision**: an opaque, serializable text `scope@value` that only grows within a data scope (the scope names the data a counter orders, for example a tenant). The store hands it out: `Governance::with_revisions(Arc<dyn RevisionSource>)` for the memory and file stores (`MemoryRevisions`), or `strig_postgres::next_revision(&tx, "my_sequence", "tenant")` inside the transaction that writes the change, so the revision commits with it. `apply_revised` and `apply_with_impact` return it (`Revised`, `AppliedWithImpact::revision`), and `Change::with_revision` carries it on the notice.
+
+```rust
+let applied = governance.apply_revised(&engine, &actor, &grants, &mutation, None, &Attributes::new())?;
+let revision = applied.revision.expect("a source was configured");   // "tenant@42"
+// hand it to whoever reads next: a header, a cookie, the response of the write
+
+let provider = EngineProvider::new(engine, loader)
+    .with_cache(cache)
+    .with_consistency(ConsistencyOptions::default().timeout(Duration::from_secs(1)));
+// provider.evaluate_revised(&subject, &scope, Some(&revision)) reloads, or waits for the Change, up to the timeout
+```
+
+An instance that is behind reloads (or waits for the `Change`) until the timeout and, without getting there, **denies with its own reason**: `revision_not_reached`, `revision_scope_mismatch` (a token of another scope), `revision_untracked` (the source cannot tell its revision) or `source_unavailable`. It never decides from older state. The `CapabilityCache` remembers the revision of each entry (`get_at_least`, `insert_revised`).
+
+- **Client protocol (version 2, additive).** `hello` carries `version`, `capabilities` carries the `revision` of the data the set was computed from, `change` carries the write's `revision`, and the client may send `refresh_at_least` with a revision; a scope that cannot be brought that far gets an `error` (`revision_not_reached`, ...), never an older set. Over SSE, which has no upstream channel, the client reconnects with `?min_revision=` and the endpoint passes it to the session.
+- **Decision server.** `/v1` accepts the token in the `x-strig-min-revision` header on every route, and in the `min_revision` field of `check` and `check/batch`. A source behind it answers `503` with `revision_not_reached` (or `revision_mismatch` for another scope); the answers carry the `revision` they were made from. These refusals do not count against the client's circuit breaker. In Rust: `Client::check_at_least` and `check_batch_at_least`; `Snapshot::with_revision` on the source.
+- **JavaScript.** `new PermissionClient({ ..., minRevision: 'tenant@42' })` or `client.requireRevision(rev)` after a write: until the capabilities reach it every decision denies (`client.behind()`, `client.revision(scope)`). The React and Angular bindings expose it: `useStrigStatus().behind` and `useRequireRevision()`, `StrigService.status().behind` and `requireRevision()`. `RemoteClient` takes `minRevision` in its options, per `check` or per `checkBatch(requests, { minRevision })`, sends the header, and denies an answer that does not prove the revision, so a server that ignores it cannot talk the client past it. `openSession` takes `revision` (what this instance has loaded) and `minRevision`.
 
 ## Postgres storage
 

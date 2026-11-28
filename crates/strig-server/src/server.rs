@@ -17,13 +17,13 @@ use axum::{Json, response::IntoResponse};
 use futures_util::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use strig::{Attributes, Context, PathLayout, QueryContext, QueryLimits, Request, Subject, Value};
+use strig::{Attributes, Context, PathLayout, QueryContext, QueryLimits, Reached, Request, Revision, Subject, Value};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use crate::authzen::{self, AuthzenConfig};
 use crate::clock::{Clock, SystemClock};
-use crate::config::ServerConfig;
+use crate::config::{MIN_REVISION_HEADER, ServerConfig};
 use crate::error::{ApiError, ErrorCode};
 use crate::source::{DecisionSource, Snapshot};
 use crate::wire::{
@@ -164,13 +164,39 @@ impl AppState {
 
 /// The instant a request has to be answered by. It covers the body, the source, the wait for a
 /// work slot and the work.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Deadline(Instant);
+///
+/// It also carries the revisions the request requires (header and body), which the snapshot must
+/// have reached before the work runs.
+#[derive(Debug, Clone)]
+pub(crate) struct Deadline(Instant, Vec<Revision>);
+
+/// Pause between two reads of the source while the data is behind a required revision.
+const REVISION_POLL: Duration = Duration::from_millis(25);
 
 impl Deadline {
     pub(crate) fn after(wait: Duration) -> Self {
-        Self(Instant::now() + wait)
+        Self(Instant::now() + wait, Vec::new())
     }
+
+    /// Also requires `revision`, when there is one.
+    #[must_use]
+    pub(crate) fn requiring(mut self, revision: Option<Revision>) -> Self {
+        self.1.extend(revision);
+        self
+    }
+}
+
+/// The revision the header asks for, if it has one. A header that is not a token is a bad request,
+/// never ignored: ignoring it would answer from data the caller said was too old.
+fn required_revision(headers: &axum::http::HeaderMap) -> Result<Option<Revision>, ApiError> {
+    let Some(raw) = headers.get(MIN_REVISION_HEADER) else {
+        return Ok(None);
+    };
+    raw.to_str()
+        .ok()
+        .and_then(|text| text.trim().parse::<Revision>().ok())
+        .map(Some)
+        .ok_or(ApiError::new(ErrorCode::InvalidRequest))
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Deadline {
@@ -178,7 +204,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Deadline {
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         // `set_deadline` runs before every decision route, so a miss is a wiring bug.
-        parts.extensions.get::<Deadline>().copied().ok_or_else(|| {
+        parts.extensions.get::<Deadline>().cloned().ok_or_else(|| {
             tracing::error!("a decision route ran without a deadline");
             ApiError::new(ErrorCode::Internal)
         })
@@ -186,9 +212,13 @@ impl<S: Send + Sync> FromRequestParts<S> for Deadline {
 }
 
 async fn set_deadline(State(state): State<AppState>, mut request: HttpRequest, next: Next) -> Response {
-    match state.config.timeout_for(request.headers()) {
-        Ok(wait) => {
-            request.extensions_mut().insert(Deadline::after(wait));
+    let deadline = state
+        .config
+        .timeout_for(request.headers())
+        .and_then(|wait| Ok(Deadline::after(wait).requiring(required_revision(request.headers())?)));
+    match deadline {
+        Ok(deadline) => {
+            request.extensions_mut().insert(deadline);
             next.run(request).await
         }
         Err(error) => error.into_response(),
@@ -257,6 +287,41 @@ impl Run {
 }
 
 impl AppState {
+    /// Loads the snapshot, and when the request requires a revision, reads again until the data has
+    /// reached it or the deadline passes. Data of another scope, or with no revision at all, is
+    /// refused at once: waiting would never settle it. All inside the request deadline.
+    async fn settled_snapshot(&self, deadline: &Deadline) -> Result<Arc<Snapshot>, ApiError> {
+        loop {
+            let snapshot = timeout_at(deadline.0, self.source.snapshot())
+                .await
+                .map_err(|_elapsed| ApiError::new(ErrorCode::DeadlineExceeded))?
+                .map_err(|error| {
+                    tracing::error!(error = ?error, "the grant source failed");
+                    ApiError::new(ErrorCode::SourceUnavailable)
+                })?;
+            let mut behind = false;
+            for required in &deadline.1 {
+                match Revision::reached_by(required, snapshot.revision.as_ref()) {
+                    Reached::Yes => {}
+                    Reached::Behind => behind = true,
+                    _ => {
+                        tracing::warn!(required = %required, "the data cannot be compared with the required revision");
+                        return Err(ApiError::new(ErrorCode::RevisionMismatch));
+                    }
+                }
+            }
+            if !behind {
+                return Ok(snapshot);
+            }
+            let wake = Instant::now() + REVISION_POLL;
+            if wake >= deadline.0 {
+                tracing::warn!("the data did not reach the required revision before the deadline");
+                return Err(ApiError::new(ErrorCode::RevisionNotReached));
+            }
+            tokio::time::sleep_until(wake).await;
+        }
+    }
+
     /// Loads the snapshot and runs `work` on a blocking thread, all inside the request deadline.
     /// Whatever goes wrong becomes an [`ApiError`]; nothing here can end in an allow.
     ///
@@ -286,13 +351,7 @@ impl AppState {
     {
         let cancel = Cancel::default();
         let _stop = cancel.on_drop();
-        let snapshot = timeout_at(deadline.0, self.source.snapshot())
-            .await
-            .map_err(|_elapsed| ApiError::new(ErrorCode::DeadlineExceeded))?
-            .map_err(|error| {
-                tracing::error!(error = ?error, "the grant source failed");
-                ApiError::new(ErrorCode::SourceUnavailable)
-            })?;
+        let snapshot = self.settled_snapshot(&deadline).await?;
         let permit = match timeout_at(deadline.0, Arc::clone(&self.workers).acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(error)) => {
@@ -346,10 +405,10 @@ where
 
     async fn from_request(request: HttpRequest, state: &S) -> Result<Self, Self::Rejection> {
         // The body is read inside the request deadline, so a client that sends it slowly is cut.
-        let deadline = request.extensions().get::<Deadline>().copied();
+        let deadline = request.extensions().get::<Deadline>().cloned();
         let read = Json::<T>::from_request(request, state);
         let outcome = match deadline {
-            Some(Deadline(at)) => timeout_at(at, read)
+            Some(Deadline(at, _)) => timeout_at(at, read)
                 .await
                 .map_err(|_elapsed| ApiError::new(ErrorCode::DeadlineExceeded))?,
             None => read.await,
@@ -385,7 +444,10 @@ async fn check(
     ApiJson(request): ApiJson<CheckRequest>,
 ) -> Result<Json<CheckResponse>, ApiError> {
     state
-        .answer(deadline, move |snapshot, run| decide(snapshot, run.now, &request))
+        .answer(
+            deadline.requiring(request.min_revision.clone()),
+            move |snapshot, run| decide(snapshot, run.now, &request),
+        )
         .await
 }
 
@@ -398,20 +460,26 @@ async fn check_batch(
         return Err(ApiError::new(ErrorCode::BatchTooLarge));
     }
     state
-        .answer(deadline, move |snapshot, run| {
-            run.ensure_budget(request.checks.len(), snapshot.grants.len())?;
-            // All or nothing: one failing item fails the batch, never a partial answer. The
-            // deadline is read between items, so a batch nobody waits for stops early.
-            let results = request
-                .checks
-                .iter()
-                .map(|check| {
-                    run.ensure_live()?;
-                    decide(snapshot, run.now, check)
+        .answer(
+            deadline.requiring(request.min_revision.clone()),
+            move |snapshot, run| {
+                run.ensure_budget(request.checks.len(), snapshot.grants.len())?;
+                // All or nothing: one failing item fails the batch, never a partial answer. The
+                // deadline is read between items, so a batch nobody waits for stops early.
+                let results = request
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        run.ensure_live()?;
+                        decide(snapshot, run.now, check)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(BatchResponse {
+                    results,
+                    revision: snapshot.revision.clone(),
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(BatchResponse { results })
-        })
+            },
+        )
         .await
 }
 
@@ -539,6 +607,7 @@ fn decide(snapshot: &Snapshot, now: u64, request: &CheckRequest) -> Result<Check
         )?,
         evaluated_at: now,
         requested_at: request.at,
+        revision: snapshot.revision.clone(),
     })
 }
 

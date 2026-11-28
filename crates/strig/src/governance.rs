@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::fmt;
-#[cfg(feature = "audit")]
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +15,7 @@ use crate::grant::{Effect, Grant, SubjectMatcher};
 use crate::impact::{Impact, ImpactOptions};
 use crate::rebac::TupleStore;
 use crate::resource::{Anchor, Resource};
+use crate::revision::{Revised, Revision, RevisionSource};
 use crate::subject::{RoleAssignment, Subject};
 
 /// Proposed change to the grant set or to a subject's roles.
@@ -289,6 +289,8 @@ pub struct AppliedWithImpact {
     /// The grants after the change, as [`Governance::apply`] returns them.
     pub grants: Vec<Grant>,
     pub impact: Impact,
+    /// The revision the change was given, when the governance has a [`RevisionSource`].
+    pub revision: Option<Revision>,
 }
 
 /// Applies grant and role changes only after they pass every invariant and, with the
@@ -298,6 +300,7 @@ pub struct Governance {
     invariants: Vec<Box<dyn Invariant>>,
     #[cfg(feature = "audit")]
     auditor: Option<Arc<Auditor>>,
+    revisions: Option<Arc<dyn RevisionSource>>,
 }
 
 impl Governance {
@@ -316,6 +319,34 @@ impl Governance {
     pub fn audited(mut self, auditor: Arc<Auditor>) -> Self {
         self.auditor = Some(auditor);
         self
+    }
+
+    /// Gives every accepted change the next revision of `source`, which the revised and impact results
+    /// carry (see [`Governance::apply_revised`]). The source belongs to the store that persists the
+    /// change: it hands out the revision after the change is applied, so a refused change takes none.
+    #[must_use]
+    pub fn with_revisions(mut self, source: Arc<dyn RevisionSource>) -> Self {
+        self.revisions = Some(source);
+        self
+    }
+
+    fn next_revision(&self) -> Option<Revision> {
+        self.revisions.as_ref().map(|source| source.next())
+    }
+
+    /// [`Governance::apply`] with the revision the accepted change was given. `None` without a
+    /// [`Governance::with_revisions`] source.
+    pub fn apply_revised(
+        &self,
+        engine: &Engine,
+        actor: &Subject,
+        current: &[Grant],
+        mutation: &Mutation,
+        tuples: Option<&dyn TupleStore>,
+        meta: &Attributes,
+    ) -> Result<Revised<Vec<Grant>>, Vec<Violation>> {
+        let grants = self.apply_with(engine, actor, current, mutation, tuples, meta)?;
+        Ok(Revised::new(grants, self.next_revision()))
     }
 
     /// The auditor `audited` set, for the records of the approval flow (see [`crate::pending`]).
@@ -415,6 +446,7 @@ impl Governance {
         result.map(|(grants, impact)| AppliedWithImpact {
             grants,
             impact: impact.unwrap_or_default(),
+            revision: self.next_revision(),
         })
     }
 
@@ -695,7 +727,22 @@ impl GovernanceAt<'_> {
         result.map(|(grants, impact)| AppliedWithImpact {
             grants,
             impact: impact.unwrap_or_default(),
+            revision: self.governance.next_revision(),
         })
+    }
+
+    /// Like [`Governance::apply_revised`], at the instant.
+    pub fn apply_revised(
+        &self,
+        engine: &Engine,
+        actor: &Subject,
+        current: &[Grant],
+        mutation: &Mutation,
+        tuples: Option<&dyn TupleStore>,
+        meta: &Attributes,
+    ) -> Result<Revised<Vec<Grant>>, Vec<Violation>> {
+        let grants = self.apply_with(engine, actor, current, mutation, tuples, meta)?;
+        Ok(Revised::new(grants, self.governance.next_revision()))
     }
 
     /// Like [`Governance::apply_with`], at the instant.

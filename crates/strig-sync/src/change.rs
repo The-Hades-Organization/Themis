@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use strig::{Anchor, Resource};
+use strig::{Anchor, Resource, Revision};
 
 /// What changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +39,10 @@ pub struct Change {
     /// Milliseconds since the Unix epoch. Filled in by the hub.
     #[serde(default)]
     pub at: u64,
+    /// The revision the store gave the write this notice announces. A receiver that decides after
+    /// a write asks for it with `at_least`. Absent for changes that are not writes (expiry, resync).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<Revision>,
 }
 
 impl Change {
@@ -51,6 +55,7 @@ impl Change {
             origin: String::new(),
             seq: 0,
             at: 0,
+            revision: None,
         }
     }
 
@@ -97,6 +102,12 @@ impl Change {
         self
     }
 
+    /// Carries the revision the store gave the write (see [`strig::RevisionSource`]).
+    pub fn with_revision(mut self, revision: Revision) -> Self {
+        self.revision = Some(revision);
+        self
+    }
+
     /// Does the change affect `subject`'s permissions on `scope`?
     pub fn affects(&self, subject: Option<&str>, scope: &Resource) -> bool {
         if self.kind == ChangeKind::Resync {
@@ -132,6 +143,17 @@ mod tests {
         let roles = Change::roles("alice", Anchor::new("project", "p1"));
         assert!(roles.affects(Some("alice"), &doc));
         assert!(!roles.affects(Some("bob"), &doc));
+    }
+
+    #[test]
+    fn the_revision_rides_the_json_and_is_absent_without_one() {
+        let change = Change::grants(Anchor::new("org", "o1")).with_revision(Revision::new("tenant", 9));
+        let json = change.to_json();
+        assert!(json.contains(r#""revision":"tenant@9""#), "{json}");
+        assert_eq!(Change::from_json(&json).unwrap(), change);
+        // A notice from an older node has no revision and still reads.
+        let old = Change::from_json(r#"{"kind":"grants","scope":{"kind":"org","id":"o1"}}"#).unwrap();
+        assert_eq!(old.revision, None);
     }
 
     #[test]

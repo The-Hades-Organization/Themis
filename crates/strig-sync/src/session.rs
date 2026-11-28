@@ -15,9 +15,11 @@ use tokio::time::{Instant, Interval, interval_at};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::change::{Change, ChangeKind};
+use crate::consistency::ConsistencyError;
 use crate::hub::Hub;
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
 use crate::provider::CapabilityProvider;
+use strig::Revision;
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -142,6 +144,7 @@ impl Worker {
         let hello = ServerMessage::Hello {
             origin,
             subject: self.subject.id.clone(),
+            version: PROTOCOL_VERSION,
         };
         if !self.send(hello).await || !self.push_all().await {
             return;
@@ -176,20 +179,31 @@ impl Worker {
     }
 
     async fn push(&mut self, scope: &Resource) -> bool {
+        self.push_at_least(scope, None).await
+    }
+
+    /// Sends the capabilities of `scope`. With `required`, they are computed from data at that
+    /// revision or later; when the provider cannot bring them there the client gets an `error` with
+    /// the reason code and no set.
+    async fn push_at_least(&mut self, scope: &Resource, required: Option<&Revision>) -> bool {
         let Some(provider) = &self.provider else {
             return true;
         };
         let provider = provider.clone();
-        let message = match provider.evaluate(&self.subject, scope).await {
-            Ok(evaluation) => {
-                self.schedule_expiry(provider.as_ref(), evaluation.next_boundary);
+        let message = match provider.evaluate_revised(&self.subject, scope, required).await {
+            Ok(revised) => {
+                self.schedule_expiry(provider.as_ref(), revised.value.next_boundary);
                 ServerMessage::Capabilities {
                     scope: scope.clone(),
-                    set: evaluation.set,
+                    set: revised.value.set,
+                    revision: revised.revision,
                 }
             }
             Err(error) => ServerMessage::Error {
-                message: error.to_string(),
+                message: match error {
+                    ConsistencyError::Source(source) => source.to_string(),
+                    other => other.code().to_owned(),
+                },
             },
         };
         self.send(message).await
@@ -296,6 +310,14 @@ impl Worker {
                 true
             }
             ClientMessage::Refresh => self.push_all().await,
+            ClientMessage::RefreshAtLeast { revision } => {
+                for scope in self.scopes.clone() {
+                    if !self.push_at_least(&scope, Some(&revision)).await {
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 }
@@ -347,7 +369,7 @@ mod tests {
         );
         assert!(matches!(next(&mut stream).await, ServerMessage::Hello { .. }));
         match next(&mut stream).await {
-            ServerMessage::Capabilities { scope, set } => {
+            ServerMessage::Capabilities { scope, set, .. } => {
                 assert_eq!(scope, p1);
                 assert_eq!(set.grants.len(), 1);
             }

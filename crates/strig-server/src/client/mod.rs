@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use strig::{Decision, Effect};
+use strig::{Decision, Effect, Revision};
 
 pub use breaker::{BreakerConfig, BreakerState, CircuitBreaker, Permit};
 pub use transport::{HttpTransport, RawResponse, Transport, TransportError};
@@ -177,18 +177,49 @@ impl Client {
         }
     }
 
+    /// Like [`Client::check`], but the server answers only from data at `min_revision` or later. A
+    /// server that is behind, or cannot compare the token, answers 503 and the call is a
+    /// [`ClientDecision::Denied`] carrying [`ErrorCode::RevisionNotReached`] or
+    /// [`ErrorCode::RevisionMismatch`]; it never decides from older data.
+    pub async fn check_at_least(&self, request: &CheckRequest, min_revision: &Revision) -> ClientDecision {
+        let mut request = request.clone();
+        request.min_revision = Some(min_revision.clone());
+        self.check(&request).await
+    }
+
+    /// Like [`Client::check_batch`], with the same `min_revision` guarantee for every check.
+    pub async fn check_batch_at_least(
+        &self,
+        requests: &[CheckRequest],
+        min_revision: &Revision,
+    ) -> Vec<ClientDecision> {
+        self.batch(requests, Some(min_revision)).await
+    }
+
     /// `requests.len()` checks in one call, answered in the same order. If the call fails, or the
     /// server answers a different number of results, every check is denied with the same cause.
     pub async fn check_batch(&self, requests: &[CheckRequest]) -> Vec<ClientDecision> {
+        self.batch(requests, None).await
+    }
+
+    async fn batch(&self, requests: &[CheckRequest], min_revision: Option<&Revision>) -> Vec<ClientDecision> {
         if requests.is_empty() {
             return Vec::new();
         }
         #[derive(Serialize)]
         struct Body<'a> {
             checks: &'a [CheckRequest],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            min_revision: Option<&'a Revision>,
         }
         let outcome = match self
-            .call::<BatchResponse>("/v1/check/batch", &Body { checks: requests })
+            .call::<BatchResponse>(
+                "/v1/check/batch",
+                &Body {
+                    checks: requests,
+                    min_revision,
+                },
+            )
             .await
         {
             Ok(answer) if answer.results.len() == requests.len() => Ok(answer.results),
@@ -290,8 +321,15 @@ impl Client {
                 }
             },
             status @ 500.. => {
-                permit.failure();
-                Err(Failure::Server { status, code: code() })
+                let code = code();
+                // A server that is up and refuses to decide from data behind the required revision is
+                // not an outage: the breaker keeps counting only the failures of the server itself.
+                if matches!(code, Some(ErrorCode::RevisionNotReached | ErrorCode::RevisionMismatch)) {
+                    permit.success();
+                } else {
+                    permit.failure();
+                }
+                Err(Failure::Server { status, code })
             }
             status @ 400..=499 => {
                 // The server is up and said no to this request: that is not an outage.

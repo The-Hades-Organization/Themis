@@ -5,9 +5,18 @@
 //! `refresh`. Over SSE the type is also sent in the `event:` field.
 
 use serde::{Deserialize, Serialize};
-use strig::{CapabilitySet, Resource};
+use strig::{CapabilitySet, Resource, Revision};
 
 use crate::change::Change;
+
+/// Version of this protocol. 2 added the revision on `capabilities` and `change`, the `version` of
+/// `hello` and the `refresh_at_least` client message; all of them are optional fields or new
+/// messages, so a version 1 peer keeps working with a version 2 one.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+fn protocol_one() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -16,11 +25,18 @@ pub enum ServerMessage {
         origin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+        /// The protocol version the server speaks ([`PROTOCOL_VERSION`]); 1 when the peer sends none.
+        #[serde(default = "protocol_one")]
+        version: u32,
     },
     /// Current grants of the subject for a watched scope. Replaces the previous set.
     Capabilities {
         scope: Resource,
         set: CapabilitySet,
+        /// The revision of the data the set was computed from, when the source tracks one. A client
+        /// that requires a minimum revision treats a set without it, or behind it, as "no decision".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<Revision>,
     },
     /// A change that affects a watched scope.
     Change {
@@ -69,6 +85,13 @@ pub enum ClientMessage {
     },
     /// Asks again for the capabilities of all the watched scopes.
     Refresh,
+    /// Like `refresh`, but every set must be computed from data at `revision` or later. A scope the
+    /// instance cannot bring that far is answered with an `error` whose message is the reason code
+    /// (`revision_not_reached`, `revision_scope_mismatch`, `revision_untracked`), never with an
+    /// older set.
+    RefreshAtLeast {
+        revision: Revision,
+    },
 }
 
 impl ClientMessage {
@@ -116,6 +139,36 @@ mod tests {
             ServerMessage::Ping.to_sse(),
             "event: ping\ndata: {\"type\":\"ping\"}\n\n"
         );
+    }
+
+    #[test]
+    fn a_version_1_hello_and_capabilities_still_read() {
+        let hello: ServerMessage = serde_json::from_str(r#"{"type":"hello","origin":"n1"}"#).unwrap();
+        assert_eq!(
+            hello,
+            ServerMessage::Hello {
+                origin: "n1".into(),
+                subject: None,
+                version: 1
+            }
+        );
+        let caps: ServerMessage = serde_json::from_str(
+            r#"{"type":"capabilities","scope":{"path":[]},"set":{"subject":{"kind":"user","id":"u"},"grants":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(caps, ServerMessage::Capabilities { revision: None, .. }));
+    }
+
+    #[test]
+    fn refresh_at_least_json() {
+        let msg = ClientMessage::from_json(r#"{"type":"refresh_at_least","revision":"t@4"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::RefreshAtLeast {
+                revision: Revision::new("t", 4)
+            }
+        );
+        assert!(ClientMessage::from_json(r#"{"type":"refresh_at_least","revision":"nope"}"#).is_err());
     }
 
     #[test]

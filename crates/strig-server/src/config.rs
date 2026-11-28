@@ -11,6 +11,11 @@ use crate::error::{ApiError, ErrorCode};
 /// longer than [`ServerConfig::max_timeout`], whatever the header says.
 pub const TIMEOUT_HEADER: &str = "x-strig-timeout-ms";
 
+/// Request header that carries the revision the answer must be computed from, as the opaque token a
+/// write returned. The server answers 503 (`revision_not_reached`, `revision_mismatch`) instead of
+/// deciding from older data. It works on every decision route, AuthZEN included.
+pub const MIN_REVISION_HEADER: &str = "x-strig-min-revision";
+
 /// Limits applied to every request.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]

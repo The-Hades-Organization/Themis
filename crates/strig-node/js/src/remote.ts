@@ -3,6 +3,7 @@
 // or an open circuit is a deny, never an allow, and no call throws.
 
 import type { Decision, Subject } from './index.js';
+import { parseRevision, revisionReached } from './protocol.js';
 import type { Resource } from './protocol.js';
 
 /** Codes of `crates/strig-server/API.md`. A code this client does not know arrives as `{ unknown: text }`. */
@@ -21,6 +22,8 @@ export type ErrorCode =
   | 'relation_depth_exceeded'
   | 'deadline_exceeded'
   | 'clock_unavailable'
+  | 'revision_not_reached'
+  | 'revision_mismatch'
   | 'internal';
 
 export type FailureReason = 'circuit_open' | 'timeout' | 'unreachable' | 'server' | 'rejected' | 'invalid_request' | 'invalid_response' | 'unexpected_status';
@@ -38,6 +41,8 @@ export interface CheckInput {
   permission: string;
   resource: Resource;
   env?: Record<string, unknown>;
+  /** Answer only from data at this revision (`scope@value`) or later; overrides `RemoteOptions.minRevision` for this check. */
+  minRevision?: string;
 }
 
 export interface RemoteResult {
@@ -45,6 +50,8 @@ export interface RemoteResult {
   allowed: boolean;
   decision?: Decision;
   evaluatedAt?: number;
+  /** The revision of the data the decision was made from, when the server tracks one. */
+  revision?: string;
   failure?: Failure;
 }
 
@@ -64,6 +71,8 @@ export interface RemoteOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   breaker?: BreakerOptions;
+  /** Read-your-writes for every call: the server answers only from data at this revision or later, else the call is denied. */
+  minRevision?: string;
 }
 
 type Permit = { generation: number; probe: boolean };
@@ -84,6 +93,8 @@ const KNOWN_CODES = new Set<string>([
   'relation_depth_exceeded',
   'deadline_exceeded',
   'clock_unavailable',
+  'revision_not_reached',
+  'revision_mismatch',
   'internal',
 ]);
 
@@ -92,6 +103,8 @@ export const ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   source_unavailable: 'the grant source is unavailable; access is denied',
   invalid_request: 'the decision request was refused',
   deadline_exceeded: 'the decision was not ready in time; access is denied',
+  revision_not_reached: 'the decision data has not reached the required revision; access is denied',
+  revision_mismatch: 'the required revision belongs to another data scope; access is denied',
   overloaded: 'the decision service is overloaded; access is denied',
   internal: 'the decision could not be computed; access is denied',
 });
@@ -193,6 +206,7 @@ interface Outcome<T> {
 interface WireDecision {
   decision: Decision;
   evaluated_at?: number;
+  revision?: string;
 }
 
 type ErrorBody = { error?: { code?: unknown } } | undefined;
@@ -203,6 +217,7 @@ export class RemoteClient {
   private readonly timeoutMs: number;
   private readonly fetch: typeof fetch;
   private readonly headers: Record<string, string>;
+  private readonly minRevision?: string;
   readonly breaker: CircuitBreaker;
 
   constructor(options: RemoteOptions) {
@@ -213,6 +228,7 @@ export class RemoteClient {
     if (typeof fetchImpl !== 'function') throw new TypeError('no fetch available: pass options.fetch');
     this.fetch = fetchImpl;
     this.headers = options.headers ?? {};
+    if (options.minRevision !== undefined) this.minRevision = checkedRevision(options.minRevision);
     this.breaker = new CircuitBreaker(options.breaker);
   }
 
@@ -220,25 +236,31 @@ export class RemoteClient {
    * One decision. `request` is `{ subject, permission, resource, env? }`.
    */
   async check(request: CheckInput): Promise<RemoteResult> {
-    const answer = await this.#call<WireDecision>('/v1/check', request, (body) => (validCheck(body) ? true : null));
+    const { minRevision, ...rest } = request;
+    const required = minRevision === undefined ? this.minRevision : checkedRevision(minRevision);
+    const answer = await this.#call<WireDecision>('/v1/check', rest, (body) => (validCheck(body) ? true : null), required);
     if (answer.failure) return { allowed: false, failure: answer.failure };
-    return toResult(answer.body!);
+    return withRevision(toResult(answer.body!), required);
   }
 
   /** Many decisions in one call; the answers keep the request order. A failed call denies every check with the same failure. Throws `TypeError` on a non-array: a programming error, not a decision. */
-  async checkBatch(requests: CheckInput[]): Promise<RemoteResult[]> {
+  async checkBatch(requests: CheckInput[], options: { minRevision?: string } = {}): Promise<RemoteResult[]> {
     if (!Array.isArray(requests)) throw new TypeError('requests must be an array');
     if (requests.length === 0) return [];
-    const answer = await this.#call<WireDecision[]>('/v1/check/batch', { checks: requests }, (body) => {
-      const results = (body as { results?: unknown } | undefined)?.results;
+    const required = options.minRevision === undefined ? this.minRevision : checkedRevision(options.minRevision);
+    let batchRevision: string | undefined;
+    const answer = await this.#call<WireDecision[]>('/v1/check/batch', { checks: requests.map(({ minRevision: _drop, ...rest }) => rest) }, (body) => {
+      const shaped = body as { results?: unknown; revision?: unknown } | undefined;
+      const results = shaped?.results;
+      if (typeof shaped?.revision === 'string') batchRevision = shaped.revision;
       return Array.isArray(results) && results.length === requests.length && results.every(validCheck) ? (results as WireDecision[]) : null;
-    });
+    }, required);
     const failure = answer.failure;
     if (failure) return requests.map(() => ({ allowed: false, failure: { ...failure } }));
-    return answer.body!.map(toResult);
+    return answer.body!.map((item) => withRevision(toResult({ ...item, revision: item.revision ?? batchRevision }), required));
   }
 
-  async #call<T>(path: string, payload: unknown, validate: (body: unknown) => T | true | null): Promise<Outcome<T>> {
+  async #call<T>(path: string, payload: unknown, validate: (body: unknown) => T | true | null, minRevision?: string): Promise<Outcome<T>> {
     // A payload that cannot be serialized is the caller's mistake: it never reaches the server or the breaker.
     let text: string | undefined;
     try {
@@ -260,7 +282,7 @@ export class RemoteClient {
         reject(new Error('timeout'));
       }, this.timeoutMs + TIMEOUT_GRACE_MS);
     });
-    const sent = this.#send(path, text, controller.signal, validate);
+    const sent = this.#send(path, text, controller.signal, validate, minRevision);
     sent.catch(() => {}); // a send that loses the race must not become an unhandled rejection
     let outcome: Outcome<T>;
     try {
@@ -276,7 +298,7 @@ export class RemoteClient {
     return outcome;
   }
 
-  async #send<T>(path: string, text: string, signal: AbortSignal, validate: (body: unknown) => T | true | null): Promise<Outcome<T>> {
+  async #send<T>(path: string, text: string, signal: AbortSignal, validate: (body: unknown) => T | true | null, minRevision?: string): Promise<Outcome<T>> {
     const response = await this.fetch(this.base + path, {
       method: 'POST',
       // A redirect is a failure (API.md): following it would also carry the custom headers to another host.
@@ -285,6 +307,7 @@ export class RemoteClient {
         ...this.headers,
         'content-type': 'application/json',
         'x-strig-timeout-ms': String(Math.max(1, Math.ceil(this.timeoutMs))),
+        ...(minRevision === undefined ? {} : { 'x-strig-min-revision': minRevision }),
       },
       body: text,
       signal,
@@ -300,12 +323,17 @@ export class RemoteClient {
       const failure = failureOf(response.status, body as ErrorBody);
       // A 4xx with an error body from the API is the server alive and refusing the request: neutral for the circuit.
       // A 4xx without one (a gateway's 401, 404, 429) says nothing about the server and counts as a failure.
-      return { failure, neutral: failure.reason === 'rejected' && hasErrorBody(body) };
+      return { failure, neutral: (failure.reason === 'rejected' && hasErrorBody(body)) || isRevisionRefusal(failure) };
     }
     const valid = body === undefined ? null : validate(body);
     if (!valid) return { failure: { reason: 'invalid_response', status: 200 } };
     return { body: valid === true ? (body as T) : valid };
   }
+}
+
+// The data is alive but behind: not a sign the server is unhealthy, so it does not open the circuit.
+function isRevisionRefusal(failure: Failure): boolean {
+  return failure.code === 'revision_not_reached' || failure.code === 'revision_mismatch';
 }
 
 function hasErrorBody(body: unknown): boolean {
@@ -327,5 +355,21 @@ function validCheck(body: unknown): boolean {
 }
 
 function toResult(body: WireDecision): RemoteResult {
-  return { allowed: body.decision.effect === 'allow', decision: body.decision, evaluatedAt: body.evaluated_at };
+  const result: RemoteResult = { allowed: body.decision.effect === 'allow', decision: body.decision, evaluatedAt: body.evaluated_at };
+  if (typeof body.revision === 'string') result.revision = body.revision;
+  return result;
+}
+
+function checkedRevision(revision: string): string {
+  if (typeof revision !== 'string' || parseRevision(revision) === undefined) throw new TypeError('minRevision must look like scope@value');
+  return revision;
+}
+
+/** A server that ignores the requirement cannot talk the client past it: an answer that does not prove the revision is a deny. */
+function withRevision(result: RemoteResult, required: string | undefined): RemoteResult {
+  if (required === undefined) return result;
+  const reached = revisionReached(required, result.revision);
+  if (reached === 'yes') return result;
+  const code = reached === 'behind' ? 'revision_not_reached' : reached === 'other_scope' ? 'revision_mismatch' : 'revision_not_reached';
+  return { allowed: false, failure: { reason: 'server', code, message: messageFor(code) } };
 }

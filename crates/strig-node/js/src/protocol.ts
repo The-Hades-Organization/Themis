@@ -20,11 +20,19 @@ export interface Change {
   origin: string;
   seq: number;
   at: number;
+  /** Revision the store gave the write, `scope@value`; absent from older nodes. */
+  revision?: string;
 }
 
 export type ServerMessage =
-  | { type: 'hello'; origin: string; subject?: string }
-  | { type: 'capabilities'; scope: Resource; set: { subject: unknown; grants: unknown[]; withFields?: unknown[] } }
+  | { type: 'hello'; origin: string; subject?: string; version?: number }
+  | {
+      type: 'capabilities';
+      scope: Resource;
+      set: { subject: unknown; grants: unknown[]; withFields?: unknown[] };
+      /** Revision of the data the set was computed from, `scope@value`. */
+      revision?: string;
+    }
   | { type: 'change'; change: Change }
   | { type: 'resync' }
   | { type: 'error'; message: string }
@@ -33,9 +41,34 @@ export type ServerMessage =
 export type ClientMessage =
   | { type: 'watch'; scopes: Resource[] }
   | { type: 'unwatch'; scopes: Resource[] }
-  | { type: 'refresh' };
+  | { type: 'refresh' }
+  | { type: 'refresh_at_least'; revision: string };
 
 export const GLOBAL = 'global';
+
+/** The protocol version this client and session speak; revisions arrived in 2. */
+export const PROTOCOL_VERSION = 2;
+
+/** How a revision compares with the one a decision requires. */
+export type Reached = 'yes' | 'behind' | 'other_scope' | 'untracked';
+
+/** Splits `scope@value` at the last `@`; `undefined` when it is not a revision. */
+export function parseRevision(text: string): { scope: string; value: bigint } | undefined {
+  const at = text.lastIndexOf('@');
+  if (at <= 0) return undefined;
+  const digits = text.slice(at + 1);
+  if (!/^\d+$/.test(digits)) return undefined;
+  return { scope: text.slice(0, at), value: BigInt(digits) };
+}
+
+/** Whether `have` reaches `required`. A missing or malformed `have` is `untracked`, never `yes`. */
+export function revisionReached(required: string, have: string | undefined): Reached {
+  const want = parseRevision(required);
+  const got = have === undefined ? undefined : parseRevision(have);
+  if (!want || !got) return 'untracked';
+  if (want.scope !== got.scope) return 'other_scope';
+  return got.value >= want.value ? 'yes' : 'behind';
+}
 
 export function anchorToString(anchor: Anchor): string {
   return anchor.id == null ? anchor.kind : `${anchor.kind}:${anchor.id}`;

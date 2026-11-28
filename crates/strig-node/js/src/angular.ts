@@ -56,7 +56,7 @@ export class StrigService<P extends string = string> {
   private readonly tick = signal(this.bridge.getVersion());
   private readonly state = signal<StrigStatus>(this.bridge.getStatus());
 
-  /** Connection state: `connected`, `resyncing` and the last `error`. */
+  /** Connection state: `connected`, `resyncing`, `behind` (a required revision not reached yet) and the last `error`. */
   readonly status: Signal<StrigStatus> = this.state.asReadonly();
 
   constructor() {
@@ -89,6 +89,11 @@ export class StrigService<P extends string = string> {
   /** Resolves `true` once capabilities arrived, `false` after `timeoutMs` (default 5000). */
   settled(timeoutMs = 5000): Promise<boolean> {
     return this.bridge.settled(timeoutMs);
+  }
+
+  /** Read your own writes: deny until the capabilities reach `revision` (the revision a write returned). */
+  requireRevision(revision: string): void {
+    if (!this.server) this.bridge.requireRevision(revision);
   }
 
   /** One-shot decision at call time. */

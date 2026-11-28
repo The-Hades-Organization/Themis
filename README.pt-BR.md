@@ -674,6 +674,27 @@ Uma sessão observa escopos, isto é, âncoras como `org:acme`. Com um `Capabili
 
 O protocolo do cliente é JSON e igual em SSE e WebSocket. O servidor envia `hello`, `capabilities`, `change`, `resync`, `error` e `ping`; o cliente envia `watch`, `unwatch` e `refresh` (só WebSocket). Para um framework web que não seja o axum, repasse o stream de `Session::open` e escreva cada mensagem com `ServerMessage::to_sse` ou `to_json`.
 
+### Ler a própria escrita
+
+Depois de uma mudança, nenhuma instância nem cliente deve decidir com estado mais velho que ela. Cada mudança aceita ganha uma **revisão**: um texto opaco e serializável `escopo@valor` que só cresce dentro de um escopo de dados (o escopo nomeia os dados que um contador ordena, por exemplo um tenant). Quem atribui é o store: `Governance::with_revisions(Arc<dyn RevisionSource>)` para os stores de memória e arquivo (`MemoryRevisions`), ou `strig_postgres::next_revision(&tx, "minha_sequence", "tenant")` dentro da transação que grava a mudança, de modo que a revisão confirma junto com ela. `apply_revised` e `apply_with_impact` a devolvem (`Revised`, `AppliedWithImpact::revision`), e `Change::with_revision` a leva no aviso.
+
+```rust
+let applied = governance.apply_revised(&engine, &actor, &grants, &mutation, None, &Attributes::new())?;
+let revision = applied.revision.expect("há uma fonte configurada");   // "tenant@42"
+// entregue a quem lê em seguida: um header, um cookie, a resposta da escrita
+
+let provider = EngineProvider::new(engine, loader)
+    .with_cache(cache)
+    .with_consistency(ConsistencyOptions::default().timeout(Duration::from_secs(1)));
+// provider.evaluate_revised(&subject, &scope, Some(&revision)) recarrega, ou espera o Change, até o timeout
+```
+
+Uma instância atrás recarrega (ou espera o `Change`) até o timeout e, sem chegar lá, **nega com motivo próprio**: `revision_not_reached`, `revision_scope_mismatch` (token de outro escopo), `revision_untracked` (a fonte não sabe dizer a própria revisão) ou `source_unavailable`. Nunca decide com estado mais velho. O `CapabilityCache` guarda a revisão de cada entrada (`get_at_least`, `insert_revised`).
+
+- **Protocolo do cliente (versão 2, aditivo).** `hello` leva `version`, `capabilities` leva a `revision` dos dados de que o conjunto foi calculado, `change` leva a `revision` da escrita, e o cliente pode enviar `refresh_at_least` com uma revisão; o escopo que não alcança essa revisão recebe um `error` (`revision_not_reached`, ...), nunca um conjunto mais velho. No SSE, que não tem canal de volta, o cliente reconecta com `?min_revision=` e o endpoint repassa à sessão.
+- **Servidor de decisão.** O `/v1` aceita o token no header `x-strig-min-revision` em toda rota, e no campo `min_revision` de `check` e `check/batch`. Uma fonte atrás dele responde `503` com `revision_not_reached` (ou `revision_mismatch`, para outro escopo); as respostas trazem a `revision` de que saíram. Essas recusas não contam contra o circuit breaker do cliente. Em Rust: `Client::check_at_least` e `check_batch_at_least`; `Snapshot::with_revision` na fonte.
+- **JavaScript.** `new PermissionClient({ ..., minRevision: 'tenant@42' })` ou `client.requireRevision(rev)` depois de uma escrita: até as capabilities alcançarem, toda decisão nega (`client.behind()`, `client.revision(escopo)`). Os bindings de React e Angular expõem o estado: `useStrigStatus().behind` e `useRequireRevision()`, `StrigService.status().behind` e `requireRevision()`. O `RemoteClient` aceita `minRevision` nas opções, por `check` ou por `checkBatch(requests, { minRevision })`, envia o header e nega a resposta que não prova a revisão, então um servidor que ignora o pedido não faz o cliente passar. `openSession` aceita `revision` (o que esta instância carregou) e `minRevision`.
+
 ## Armazenamento em Postgres
 
 O `strig-postgres` também guarda os dados no Postgres: grants, tuplas ReBAC, atribuições de papel e pedidos pendentes, atrás dos mesmos traits que o motor já lê (`GrantSource`, `GrantIndex`, `TupleStore`, `TupleIndex`, `PendingStore`).

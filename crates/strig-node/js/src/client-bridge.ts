@@ -11,9 +11,13 @@ export interface StrigStatus {
   readonly resyncing: boolean;
   /** The last transport or server error, cleared when the stream opens again. */
   readonly error: Error | undefined;
+  /** A minimum revision is required and the capabilities have not reached it: every decision denies. */
+  readonly behind: boolean;
+  /** The revision the required scope's capabilities were computed from, when known. */
+  readonly required: string | undefined;
 }
 
-export const DISCONNECTED: StrigStatus = Object.freeze({ connected: false, resyncing: false, error: undefined });
+export const DISCONNECTED: StrigStatus = Object.freeze({ connected: false, resyncing: false, error: undefined, behind: false, required: undefined });
 
 // `release()` closes on the next tick, so a release followed at once by a retain (React StrictMode) keeps one stream.
 const CLOSE_DELAY_MS = 0;
@@ -41,6 +45,7 @@ export class ClientBridge<P extends string = string> {
       this.received = false;
       this.update({ resyncing: true });
     });
+    client.on('revision', () => this.update({}));
     client.on('error', (error) => this.update({ error }));
     client.on('disconnect', () => this.drop());
     client.on('close', () => this.drop());
@@ -57,6 +62,8 @@ export class ClientBridge<P extends string = string> {
       connected: this.opened && this.received,
       resyncing: patch.resyncing ?? this.status.resyncing,
       error: 'error' in patch ? patch.error : this.status.error,
+      behind: this.client.behind(),
+      required: this.client.minRevision,
     };
     this.version += 1;
     for (const listener of [...this.listeners]) listener();
@@ -78,6 +85,11 @@ export class ClientBridge<P extends string = string> {
       this.listeners.delete(listener);
     };
   };
+
+  /** Asks for capabilities at `revision` or later (the revision of a write just made). Denies until they arrive. */
+  requireRevision(revision: string): void {
+    this.client.requireRevision(revision);
+  }
 
   /** `true` only with an open stream, received capabilities and an allow from the local engine. */
   can(permission: string, resource: Resource): boolean {

@@ -41,6 +41,12 @@ pub enum ErrorCode {
     Overloaded,
     /// 503: the server clock has no usable instant.
     ClockUnavailable,
+    /// 503: the data the server decides from is older than the `min_revision` the request requires,
+    /// and did not catch up before the deadline.
+    RevisionNotReached,
+    /// 503: the required revision cannot be compared with the data: it belongs to another data
+    /// scope, or the source does not number its writes.
+    RevisionMismatch,
     /// 503: anything else that went wrong inside the server, a panic included.
     Internal,
     /// A code this version does not know. The server never sends it; it only comes out of
@@ -66,6 +72,8 @@ impl ErrorCode {
             ErrorCode::DeadlineExceeded => "deadline_exceeded",
             ErrorCode::Overloaded => "overloaded",
             ErrorCode::ClockUnavailable => "clock_unavailable",
+            ErrorCode::RevisionNotReached => "revision_not_reached",
+            ErrorCode::RevisionMismatch => "revision_mismatch",
             ErrorCode::Internal => "internal",
             ErrorCode::Unknown(code) => code,
         }
@@ -87,6 +95,8 @@ impl ErrorCode {
             | ErrorCode::DeadlineExceeded
             | ErrorCode::Overloaded
             | ErrorCode::ClockUnavailable
+            | ErrorCode::RevisionNotReached
+            | ErrorCode::RevisionMismatch
             | ErrorCode::Internal
             | ErrorCode::Unknown(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -110,6 +120,10 @@ impl ErrorCode {
             ErrorCode::DeadlineExceeded => "the deadline passed before an answer was ready; access is denied",
             ErrorCode::Overloaded => "the server is at capacity; access is denied",
             ErrorCode::ClockUnavailable => "the server clock is unavailable; access is denied",
+            ErrorCode::RevisionNotReached => "the server has not reached the required revision; access is denied",
+            ErrorCode::RevisionMismatch => {
+                "the required revision cannot be compared with the server data; access is denied"
+            }
             ErrorCode::Internal => "internal error; access is denied",
             ErrorCode::Unknown(_) => "unrecognized error; access is denied",
         }
@@ -138,6 +152,8 @@ impl From<&str> for ErrorCode {
             "deadline_exceeded" => ErrorCode::DeadlineExceeded,
             "overloaded" => ErrorCode::Overloaded,
             "clock_unavailable" => ErrorCode::ClockUnavailable,
+            "revision_not_reached" => ErrorCode::RevisionNotReached,
+            "revision_mismatch" => ErrorCode::RevisionMismatch,
             "internal" => ErrorCode::Internal,
             other => ErrorCode::Unknown(other.to_owned()),
         }
@@ -220,7 +236,7 @@ mod tests {
     use super::*;
 
     /// Every known code with the status and the text the contract (`API.md`) promises.
-    const TABLE: [(ErrorCode, u16, &str); 15] = [
+    const TABLE: [(ErrorCode, u16, &str); 17] = [
         (ErrorCode::MalformedJson, 400, "malformed_json"),
         (ErrorCode::InvalidRequest, 400, "invalid_request"),
         (ErrorCode::BatchTooLarge, 400, "batch_too_large"),
@@ -235,6 +251,8 @@ mod tests {
         (ErrorCode::DeadlineExceeded, 503, "deadline_exceeded"),
         (ErrorCode::Overloaded, 503, "overloaded"),
         (ErrorCode::ClockUnavailable, 503, "clock_unavailable"),
+        (ErrorCode::RevisionNotReached, 503, "revision_not_reached"),
+        (ErrorCode::RevisionMismatch, 503, "revision_mismatch"),
         (ErrorCode::Internal, 503, "internal"),
     ];
 

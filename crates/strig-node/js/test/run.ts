@@ -8,6 +8,7 @@ import { load, scopeFromString } from '../dist/node.js';
 import './binding040.js';
 import './hooks.js';
 import './batch.js';
+import './revision.js';
 import './fields.js';
 import './why-not.js';
 import './audit.js';
@@ -250,6 +251,80 @@ await test('cliente SSE contra servidor JS', async () => {
         await hub.publish(change('grants', { kind: 'project', id: 'p1' }));
       },
     });
+  } finally {
+    server.stop();
+  }
+});
+
+async function serveRevisions(hub: Hub, state: { rev: number }) {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    pipeSse(res, {
+      hub,
+      subject: { kind: 'user', id: 'bob' },
+      scopes: url.searchParams.getAll('scope').map(scopeFromString),
+      provider,
+      heartbeatMs: 0,
+      revision: () => `tenant@${state.rev}`,
+      minRevision: url.searchParams.get('min_revision') ?? undefined,
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  return { url: `http://127.0.0.1:${port}/events`, stop: () => (server.closeAllConnections(), server.close()) };
+}
+
+await test('leitura da própria escrita: cliente atrás nega e decide quando a revisão chega', async () => {
+  grants.length = 0;
+  grants.push({ ...memberGrant, id: 'bob-edit', subject: { kind: 'user', id: 'bob' }, permission: 'project.edit' });
+  const hub = new Hub();
+  const state = { rev: 1 };
+  const server = await serveRevisions(hub, state);
+  try {
+    const client = new PermissionClient({ url: server.url, scopes: [p1], strig, engine, minRevision: 'tenant@2' });
+    const errors: string[] = [];
+    client.on('error', (e) => errors.push(e.message));
+    client.connect();
+    await until(() => errors.includes('revision_not_reached'));
+    assert.equal(client.can('project.edit', doc), false, 'atrás: sem decisão, nega');
+    assert.equal(client.behind(), true);
+    state.rev = 2;
+    await hub.publish(change('grants', { kind: 'project', id: 'p1' }));
+    await until(() => client.can('project.edit', doc), 4000);
+    assert.equal(client.behind(), false);
+    assert.equal(client.revision(p1), 'tenant@2');
+    client.close();
+  } finally {
+    server.stop();
+  }
+});
+
+await test('leitura da própria escrita: requireRevision em cliente já conectado e escopo de outro dado', async () => {
+  grants.length = 0;
+  grants.push({ ...memberGrant, id: 'bob-edit', subject: { kind: 'user', id: 'bob' }, permission: 'project.edit' });
+  const hub = new Hub();
+  const state = { rev: 1 };
+  const server = await serveRevisions(hub, state);
+  try {
+    const client = new PermissionClient({ url: server.url, scopes: [p1], strig, engine });
+    const updates: unknown[] = [];
+    client.on('capabilities', (m) => updates.push(m));
+    client.connect();
+    await until(() => client.can('project.edit', doc));
+    client.requireRevision('tenant@3');
+    assert.equal(client.can('project.edit', doc), false, 'exigiu a revisão: nega até alcançá-la');
+    assert.equal(client.minRevision, 'tenant@3');
+    client.requireRevision('tenant@2');
+    assert.equal(client.minRevision, 'tenant@3', 'a exigência nunca recua');
+    await new Promise((r) => setTimeout(r, 100));
+    state.rev = 3;
+    await hub.publish(change('grants', { kind: 'project', id: 'p1' }));
+    await until(() => client.can('project.edit', doc), 4000);
+    client.requireRevision('other@1');
+    assert.equal(client.can('project.edit', doc), false, 'revisão de outro escopo nega');
+    assert.throws(() => client.requireRevision('sem-arroba'));
+    client.close();
   } finally {
     server.stop();
   }

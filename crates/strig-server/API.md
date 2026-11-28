@@ -35,6 +35,8 @@ text; those stay in the server log.
 | 503 | `overloaded` | No work slot was free before the deadline (default: one per CPU). |
 | 503 | `relation_depth_exceeded` | A relation chain was too deep to read a deny. |
 | 503 | `deadline_exceeded` | The deadline passed before an answer was ready. |
+| 503 | `revision_not_reached` | `x-strig-min-revision` (or `min_revision`) asked for a revision the source has not reached. Deny, retry later. |
+| 503 | `revision_mismatch` | The required revision belongs to another data scope than the source's, or the source tracks none. |
 | 503 | `clock_unavailable` | The server clock has no usable instant. |
 | 503 | `internal` | Anything else that went wrong inside the server, including a panic in a handler (caught; the process keeps running). |
 
@@ -48,6 +50,15 @@ default (2 s). The server caps the value at its ceiling (default 10 s). `0`, a n
 invalid_request`. When the deadline passes the answer is `503 deadline_exceeded`. The deadline covers reading the body
 and the work itself, and is checked between the items of a batch and around queries, so abandoned work stops early. It
 starts when the headers arrive: a read timeout for the headers belongs to the listener (hyper `header_read_timeout`).
+
+## Minimum revision
+
+Read your own writes: send `x-strig-min-revision: <scope>@<value>` (any route) or the `min_revision` field of `check`
+and `check/batch` to answer only from data at that revision or later. A source whose revision is behind is polled until the deadline and then answers `503 revision_not_reached`; one that
+tracks another scope, or no revision at all, answers `503 revision_mismatch` at once, never an answer from unproven data.
+A malformed token is `400
+invalid_request`. The answers of `check` and `check/batch` carry `revision` when the source tracks one. The Rust client
+has `check_at_least` and `check_batch_at_least`, which also refuse an answer that does not prove the revision.
 
 ## Limits
 

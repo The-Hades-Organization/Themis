@@ -29,7 +29,7 @@ pub mod client;
 
 pub use authzen::{AuthzenConfig, AuthzenConfigError, PathResolver, ResourceCatalog};
 pub use clock::{BrokenClock, Clock, ManualClock, MonotonicClock, SystemClock};
-pub use config::{ServerConfig, TIMEOUT_HEADER};
+pub use config::{MIN_REVISION_HEADER, ServerConfig, TIMEOUT_HEADER};
 #[cfg(feature = "envoy")]
 pub use envoy::{EnvoyConfig, EnvoyConfigError, EnvoyService, ResourceTemplate, RouteRule};
 pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetail};

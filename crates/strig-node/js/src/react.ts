@@ -43,7 +43,7 @@ export function useCan<P extends string = string>(permission: PermissionArg<P>, 
   );
 }
 
-/** Connection state: `connected`, `resyncing` and the last `error`. */
+/** Connection state: `connected`, `resyncing`, `behind` (a required revision not reached yet) and the last `error`. */
 export function useStrigStatus(): StrigStatus {
   const bridge = useContext(Context);
   return useSyncExternalStore(
@@ -51,6 +51,12 @@ export function useStrigStatus(): StrigStatus {
     bridge ? () => bridge.getStatus() : alwaysDisconnected,
     alwaysDisconnected,
   );
+}
+
+/** Returns `requireRevision(revision)`: after a write, deny until the capabilities reach the write's revision. */
+export function useRequireRevision(): (revision: string) => void {
+  const bridge = useContext(Context);
+  return useMemo(() => (revision: string) => bridge?.requireRevision(revision), [bridge]);
 }
 
 export interface CanProps<P extends string = string> {
