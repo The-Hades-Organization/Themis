@@ -369,14 +369,13 @@ jobs:
   pypi:
     name: PyPI
     needs: [python-wheels, python-sdist]
-    # Off until the repository variable PYPI_PUBLISH is set to "true", after the Trusted Publisher is
-    # registered on PyPI (see docs/versioning.md). The wheels above are built on every tag either way.
+    # Off unless the repository variable PYPI_PUBLISH is "true". Publishes with the PYPI_API_TOKEN secret of
+    # the pypi environment. The wheels above are built on every tag either way.
     if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -384,8 +383,9 @@ jobs:
           path: dist
           merge-multiple: true
       - run: ls -l dist && test "$(ls dist/*.whl | wc -l)" -eq 5 && test "$(ls dist/*.tar.gz | wc -l)" -eq 1
-      - name: Publish with Trusted Publishing (OIDC, no token)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dist
           skip-existing: true
